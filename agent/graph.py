@@ -17,7 +17,11 @@ from agent.mcp_adapter import build_langchain_tools
 from agent.mcp_manager import MCPManager
 from agent.memory.db import ChatDB
 from agent.memory.vector import VectorStore
-from agent.tools.computer import get_computer_tools, set_confirm_config
+from agent.tools.computer import (
+    get_computer_tools,
+    inject_screenshots,
+    set_confirm_config,
+)
 from agent.trace import TraceCollector, activate_trace, display_content, duration_ms
 
 logger = logging.getLogger(__name__)
@@ -51,6 +55,8 @@ class AgentGraph:
         self._vector: VectorStore | None = None
         self._llm_backend: str = "openrouter"
         self._model_name: str = ""
+        self._groq_llm: Any = None
+        self._groq_model: str = ""
 
     def _load(self) -> None:
         with open(self.config_path, "r", encoding="utf-8") as f:
@@ -80,6 +86,8 @@ class AgentGraph:
 
     def _make_llm(self) -> None:
         """Build the LLM based on the configured backend."""
+        from langchain_openai import ChatOpenAI  # noqa: F811
+
         llm_cfg = self._cfg.get("llm", {})
         self._llm_backend = llm_cfg.get("backend", "openrouter").lower()
         temperature = self._cfg.get("agent", {}).get("temperature", 0.3)
@@ -95,8 +103,6 @@ class AgentGraph:
                 temperature=temperature,
             )
         elif self._llm_backend == "deepseek":
-            from langchain_openai import ChatOpenAI
-
             ocfg = llm_cfg.get("deepseek", {})
             self._model_name = ocfg.get("model", "deepseek-v4-flash")
             self._llm = ChatOpenAI(
@@ -106,8 +112,6 @@ class AgentGraph:
                 temperature=temperature,
             )
         else:
-            from langchain_openai import ChatOpenAI
-
             ocfg = llm_cfg.get("openrouter", {})
             self._model_name = ocfg.get("model", "z-ai/glm-4.5")
             self._llm = ChatOpenAI(
@@ -116,6 +120,43 @@ class AgentGraph:
                 openai_api_base=ocfg.get("base_url", "https://openrouter.ai/api/v1"),
                 temperature=temperature,
             )
+
+        groq_cfg = llm_cfg.get("groq", {})
+        groq_key = groq_cfg.get("api_key", "")
+        if groq_key and groq_key not in ("", "gsk_REPLACE_ME"):
+            self._groq_model = groq_cfg.get("model", "meta-llama/llama-4-scout-17b-16e-instruct")
+            self._groq_llm = ChatOpenAI(
+                model=self._groq_model,
+                openai_api_key=groq_key,
+                openai_api_base=groq_cfg.get("base_url", "https://api.groq.com/openai/v1"),
+                temperature=0.0,
+            )
+            logger.info("Groq vision LLM ready: %s", self._groq_model)
+
+    _STRIP_ADDITIONAL_KW = frozenset({"reasoning_content", "reasoning_details"})
+
+    @staticmethod
+    def _sanitize_messages(messages: list[Any]) -> list[Any]:
+        """Return a copy of *messages* with provider-specific ``additional_kwargs``
+        stripped from every ``AIMessage`` (e.g. ``reasoning_content`` from DeepSeek
+        which Groq / other backends reject).
+        """
+        out: list[Any] = []
+        for m in messages:
+            if isinstance(m, AIMessage) and (
+                bad := AgentGraph._STRIP_ADDITIONAL_KW.intersection(
+                    m.additional_kwargs or {}
+                )
+            ):
+                ak = {
+                    k: v
+                    for k, v in m.additional_kwargs.items()
+                    if k not in AgentGraph._STRIP_ADDITIONAL_KW
+                }
+                out.append(m.model_copy(update={"additional_kwargs": ak}))
+            else:
+                out.append(m)
+        return out
 
     async def setup(self) -> None:
         """Async init: load config, start MCP, build LLM+tools+graph."""
@@ -143,8 +184,39 @@ class AgentGraph:
             msgs = list(state.get("messages", []))
             if not msgs or not isinstance(msgs[0], SystemMessage):
                 msgs = [SystemMessage(content=self._persona)] + msgs
+            msgs = AgentGraph._sanitize_messages(msgs)
             trace = state.get("trace")
             llm_call = state.get("llm_calls_made", 0) + 1
+
+            if self._groq_llm is not None and msgs and isinstance(msgs[-1], ToolMessage) and getattr(msgs[-1], "name", None) == "computer_screenshot":
+                vision_start = time.perf_counter()
+                if trace:
+                    trace.emit(
+                        "vision_started",
+                        model=self._groq_model,
+                        backend="groq",
+                    )
+                try:
+                    vision_msgs = inject_screenshots(msgs)
+                    groq_resp = await self._groq_llm.ainvoke(vision_msgs)
+                    msgs = msgs + [groq_resp]
+                    if trace:
+                        trace.emit(
+                            "vision_completed",
+                            duration_ms=duration_ms(vision_start),
+                            content=display_content(groq_resp.content),
+                            usage=getattr(groq_resp, "usage_metadata", None) or {},
+                        )
+                except Exception as exc:
+                    logger.warning("Groq vision call failed: %s", exc)
+                    if trace:
+                        trace.emit(
+                            "vision_failed",
+                            duration_ms=duration_ms(vision_start),
+                            error_type=type(exc).__name__,
+                            error=str(exc),
+                        )
+
             start = time.perf_counter()
             if trace:
                 trace.emit(

@@ -16,7 +16,7 @@ import logging
 import time
 from typing import Any
 
-from langchain_core.messages import HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
 
@@ -59,13 +59,32 @@ def _pop_screenshot() -> str | None:
     return None
 
 
+_STRIP_KEYS = frozenset({"reasoning_content", "reasoning_details"})
+
+
+def _sanitize_additional_kwargs(m: AIMessage) -> AIMessage:
+    """Return a copy of *m* with provider-specific ``additional_kwargs`` stripped."""
+    ak = {
+        k: v
+        for k, v in (m.additional_kwargs or {}).items()
+        if k not in _STRIP_KEYS
+    }
+    if len(ak) == len(m.additional_kwargs or {}):
+        return m  # no change, reuse original
+    return m.model_copy(update={"additional_kwargs": ak})
+
+
 def inject_screenshots(messages: list[Any]) -> list[Any]:
     """Wrap ``computer_screenshot`` ToolMessages with a follow-up HumanMessage
     carrying the image, as Groq and some vision APIs reject images in ToolMessages.
+
+    Also strips provider-specific ``additional_kwargs`` fields
+    (e.g. ``reasoning_content`` from DeepSeek) that other backends reject.
     """
     result: list[Any] = []
     for m in messages:
-        result.append(m)
+        clean = _sanitize_additional_kwargs(m) if isinstance(m, AIMessage) else m
+        result.append(clean)
         if isinstance(m, ToolMessage) and getattr(m, "name", None) == "computer_screenshot":
             b64 = _pop_screenshot()
             if b64:
