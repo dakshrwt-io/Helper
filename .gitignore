@@ -23,8 +23,15 @@ pm2_logs/
 .vscode/
 .idea/
 
+# Node
 node_modules/
-.venv/
-.env
-__pycache__/
-*.pyc
+
+# Testing
+.pytest_cache/
+
+# Playwright MCP snapshots
+.playwright-mcp/
+
+# OS
+Thumbs.db
+Desktop.ini

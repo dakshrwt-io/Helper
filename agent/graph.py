@@ -93,6 +93,17 @@ class AgentGraph:
                 base_url=ocfg.get("base_url", "http://127.0.0.1:11434"),
                 temperature=temperature,
             )
+        elif self._llm_backend == "deepseek":
+            from langchain_openai import ChatOpenAI
+
+            ocfg = llm_cfg.get("deepseek", {})
+            self._model_name = ocfg.get("model", "deepseek-v4-flash")
+            self._llm = ChatOpenAI(
+                model=self._model_name,
+                openai_api_key=ocfg.get("api_key", ""),
+                openai_api_base=ocfg.get("base_url", "https://api.deepseek.com"),
+                temperature=temperature,
+            )
         else:
             from langchain_openai import ChatOpenAI
 

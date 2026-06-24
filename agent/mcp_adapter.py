@@ -43,15 +43,16 @@ def _make_tool(mcp_tool: MCPTool, mgr: MCPManager) -> StructuredTool:
     async def _run(**kwargs: Any) -> str:
         trace = get_active_trace()
         start = time.perf_counter()
+        clean_args = {k: v for k, v in kwargs.items() if v is not None}
         if trace:
             trace.emit(
                 "tool_started",
                 tool_name=name,
                 server=mgr.tool_server(name),
-                arguments=kwargs,
+                arguments=clean_args,
             )
         try:
-            result = await mgr.call_tool(name, kwargs)
+            result = await mgr.call_tool(name, clean_args)
         except Exception as exc:
             if trace:
                 trace.emit(

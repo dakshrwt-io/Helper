@@ -1,5 +1,5 @@
 llm:
-  backend: ${LLM_BACKEND}          # openrouter | ollama
+  backend: ${LLM_BACKEND}          # openrouter | ollama | deepseek
   openrouter:
     model: ${MODEL}
     api_key: ${OPENROUTER_API_KEY}
@@ -7,6 +7,10 @@ llm:
   ollama:
     model: ${OLLAMA_MODEL}
     base_url: ${OLLAMA_BASE_URL}
+  deepseek:
+    model: ${DEEPSEEK_MODEL}
+    api_key: ${DEEPSEEK_API_KEY}
+    base_url: ${DEEPSEEK_BASE_URL}
 
 daily_cost_usd: ${DAILY_COST_USD}
 
@@ -16,7 +20,7 @@ mcp:
     args:
       - -y
       - "@modelcontextprotocol/server-filesystem"
-      - "C:\\Personal ai agent"
+      - "${FILESYSTEM_MCP_DIR}"
     transport: stdio
   playwright:
     command: npx
@@ -25,7 +29,7 @@ mcp:
       - "@playwright/mcp"
       - "--headless"
       - "--executable-path"
-      - "C:\\Users\\daksh\\AppData\\Local\\ms-playwright\\chromium-1228\\chrome-win64\\chrome.exe"
+      - "${PLAYWRIGHT_EXEC_PATH}"
     transport: stdio
 
 memory:
@@ -36,6 +40,11 @@ web:
   port: ${WEB_PORT}
   host: 127.0.0.1
   auth: false
+
+telegram:
+  enabled: ${TELEGRAM_ENABLED}
+  token: ${TELEGRAM_BOT_TOKEN}
+  allowed_users: ${TELEGRAM_ALLOWED_USERS}
 
 agent:
   persona_path: ${PERSONA_PATH}

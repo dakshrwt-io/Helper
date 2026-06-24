@@ -11,25 +11,20 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 
-from agent.graph import AgentGraph
+from agent.shared import get_graph, get_chat_lock, get_chat_bus
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("agent.web")
 
-_graph: AgentGraph | None = None
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _graph
-    cfg = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.yaml")
-    _graph = AgentGraph(config_path=cfg)
-    await _graph.setup()
-    logger.info("AgentGraph ready. tools=%d", len(_graph.mcp.tool_names))
+    graph = get_graph()
+    if graph:
+        logger.info("AgentGraph ready. tools=%d", len(graph.mcp.tool_names) if graph.mcp else 0)
     yield
-    await _graph.close()
-    logger.info("AgentGraph closed")
+    logger.info("Web server shutting down")
 
 
 app = FastAPI(lifespan=lifespan)
@@ -42,20 +37,25 @@ async def index():
 
 @app.get("/health")
 async def health():
+    graph = get_graph()
     return JSONResponse({
         "status": "ok",
-        "tools": len(_graph.mcp.tool_names) if _graph else 0,
-        "spent_today": _graph._chatdb.spent_today() if _graph and _graph._chatdb else 0.0,
-        "daily_cap": _graph._daily_cap if _graph else 0.0,
+        "tools": len(graph.mcp.tool_names) if graph and graph.mcp else 0,
+        "spent_today": graph._chatdb.spent_today() if graph and graph._chatdb else 0.0,
+        "daily_cap": graph._daily_cap if graph else 0.0,
     })
 
 
 async def _run_chat_with_trace(ws: WebSocket, user_text: str, session_id: str) -> dict:
     """Run a turn while forwarding its internal execution events to the client."""
+    graph = get_graph()
     trace_queue: asyncio.Queue[dict] = asyncio.Queue()
-    chat_task = asyncio.create_task(
-        _graph.chat(user_text, session_id=session_id, trace_queue=trace_queue)
-    )
+
+    async def _locked_chat():
+        async with get_chat_lock():
+            return await graph.chat(user_text, session_id=session_id, trace_queue=trace_queue)
+
+    chat_task = asyncio.create_task(_locked_chat())
     event_task: asyncio.Task | None = asyncio.create_task(trace_queue.get())
     deadline = asyncio.get_running_loop().time() + 180
 
@@ -98,7 +98,35 @@ async def _run_chat_with_trace(ws: WebSocket, user_text: str, session_id: str) -
 async def chat_ws(ws: WebSocket):
     await ws.accept()
     logger.info("WS connected")
+
+    bus = get_chat_bus()
+    bus_queue: asyncio.Queue = asyncio.Queue()
+    ws_lock = asyncio.Lock()
+
+    async def _relay(event: dict) -> None:
+        await bus_queue.put(event)
+
+    sub_id = await bus.subscribe(_relay)
+
+    async def _forwarder() -> None:
+        while True:
+            try:
+                event = await bus_queue.get()
+                async with ws_lock:
+                    await ws.send_json(event)
+            except Exception:
+                break
+
+    fwd_task = asyncio.create_task(_forwarder())
+
     try:
+        graph = get_graph()
+        if graph and graph._chatdb:
+            history = graph._chatdb.get_history("default", limit=50)
+            if history:
+                async with ws_lock:
+                    await ws.send_json({"type": "history", "messages": history})
+
         while True:
             raw = await ws.receive_text()
             try:
@@ -110,26 +138,54 @@ async def chat_ws(ws: WebSocket):
                 session_id = "default"
 
             if not user_text:
-                await ws.send_json({"type": "error", "text": "Empty message"})
+                async with ws_lock:
+                    await ws.send_json({"type": "error", "text": "Empty message"})
                 continue
 
-            await ws.send_json({"type": "thinking"})
+            while not bus_queue.empty():
+                try:
+                    event = bus_queue.get_nowait()
+                    async with ws_lock:
+                        await ws.send_json(event)
+                except Exception:
+                    break
+
+            async with ws_lock:
+                await ws.send_json({"type": "thinking"})
+
             try:
                 result = await _run_chat_with_trace(ws, user_text, session_id)
-                await ws.send_json({
-                    "type": "answer",
-                    "text": result["text"],
-                    "cost_spent": round(result["cost_spent"], 6),
-                    "spent_today": round(_graph._chatdb.spent_today(), 6) if _graph._chatdb else 0.0,
-                    "daily_cap": _graph._daily_cap,
-                })
+                async with ws_lock:
+                    await ws.send_json({
+                        "type": "answer",
+                        "text": result["text"],
+                        "cost_spent": round(result["cost_spent"], 6),
+                        "spent_today": round(graph._chatdb.spent_today(), 6) if graph and graph._chatdb else 0.0,
+                        "daily_cap": graph._daily_cap if graph else 0.0,
+                    })
             except asyncio.TimeoutError:
-                await ws.send_json({"type": "error", "text": "Agent timed out (180s)"})
+                async with ws_lock:
+                    await ws.send_json({"type": "error", "text": "Agent timed out (180s)"})
             except Exception as e:
                 logger.exception("chat error")
-                await ws.send_json({"type": "error", "text": f"Error: {e}"})
+                async with ws_lock:
+                    await ws.send_json({"type": "error", "text": f"Error: {e}"})
     except WebSocketDisconnect:
         logger.info("WS disconnected")
+    finally:
+        await bus.unsubscribe(sub_id)
+        fwd_task.cancel()
+        try:
+            await fwd_task
+        except asyncio.CancelledError:
+            pass
+
+
+def create_app(graph):
+    """Build the FastAPI app with an existing AgentGraph."""
+    from agent.shared import set_graph
+    set_graph(graph)
+    return app
 
 
 def main():
