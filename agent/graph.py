@@ -17,6 +17,7 @@ from agent.mcp_adapter import build_langchain_tools
 from agent.mcp_manager import MCPManager
 from agent.memory.db import ChatDB
 from agent.memory.vector import VectorStore
+from agent.tools.computer import get_computer_tools, set_confirm_config
 from agent.trace import TraceCollector, activate_trace, display_content, duration_ms
 
 logger = logging.getLogger(__name__)
@@ -121,6 +122,15 @@ class AgentGraph:
         self._load()
         await self.mcp.start()
         tools = await build_langchain_tools(self.mcp)
+
+        cc = self._cfg.get("computer_control", {})
+        if str(cc.get("enabled", "")).lower() == "true":
+            set_confirm_config(
+                enabled=str(cc.get("confirm_actions", "true")).lower() == "true",
+                timeout=float(cc.get("confirm_timeout", 60)),
+            )
+            tools.extend(get_computer_tools())
+
         self._make_llm()
         self._llm_with_tools = self._llm.bind_tools(tools) if tools else self._llm
         self._tools_node = ToolNode(tools) if tools else None

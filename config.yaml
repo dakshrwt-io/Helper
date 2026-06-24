@@ -11,6 +11,12 @@ llm:
     model: ${DEEPSEEK_MODEL}
     api_key: ${DEEPSEEK_API_KEY}
     base_url: ${DEEPSEEK_BASE_URL}
+    thinking: ${DEEPSEEK_THINKING}
+    reasoning_effort: ${DEEPSEEK_REASONING_EFFORT}
+  groq:
+    model: ${GROQ_MODEL}
+    api_key: ${GROQ_API_KEY}
+    base_url: ${GROQ_BASE_URL}
 
 daily_cost_usd: ${DAILY_COST_USD}
 
@@ -21,15 +27,6 @@ mcp:
       - -y
       - "@modelcontextprotocol/server-filesystem"
       - "${FILESYSTEM_MCP_DIR}"
-    transport: stdio
-  playwright:
-    command: npx
-    args:
-      - -y
-      - "@playwright/mcp"
-      - "--headless"
-      - "--executable-path"
-      - "${PLAYWRIGHT_EXEC_PATH}"
     transport: stdio
 
 memory:
@@ -45,6 +42,11 @@ telegram:
   enabled: ${TELEGRAM_ENABLED}
   token: ${TELEGRAM_BOT_TOKEN}
   allowed_users: ${TELEGRAM_ALLOWED_USERS}
+
+computer_control:
+  enabled: ${COMPUTER_CONTROL_ENABLED}
+  confirm_actions: ${COMPUTER_CONTROL_CONFIRM}
+  confirm_timeout: 60
 
 agent:
   persona_path: ${PERSONA_PATH}

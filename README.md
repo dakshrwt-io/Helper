@@ -1,6 +1,6 @@
 # Personal AI Agent
 
-A 24x7 personal AI assistant running on your local Windows machine, accessible via a web UI. Built with LangGraph + LangChain, powered by OpenRouter (z-ai/glm-5.2), with filesystem and browser (Playwright) tools via Model Context Protocol (MCP), persistent memory (SQLite + ChromaDB), a daily cost cap, and auto-restart via PM2.
+A 24x7 personal AI assistant running on your local Windows machine, accessible via a web UI. Built with LangGraph + LangChain, powered by OpenRouter or Ollama, with filesystem tools via Model Context Protocol (MCP), computer control (PyAutoGUI), persistent memory (SQLite + ChromaDB), a daily cost cap, and auto-restart via PM2.
 
 ---
 
@@ -25,7 +25,7 @@ A 24x7 personal AI assistant running on your local Windows machine, accessible v
 
 ## Overview
 
-The agent runs as a FastAPI web server on `http://127.0.0.1:8000` (localhost only, no auth). You chat with it through a browser UI. It can read/write files in your workspace and drive a real browser (Playwright, headed mode) to navigate websites, click, fill forms, extract content, and more.
+The agent runs as a FastAPI web server on `http://127.0.0.1:8000` (localhost only, no auth). You chat with it through a browser UI. It can read/write files in your workspace, control your computer via PyAutoGUI (click, type, scroll, hotkeys), and more.
 
 **Trigger model:** On-message only. The agent does nothing unless you send it a message. (Future versions may add scheduled/autonomous tasks.)
 
@@ -42,7 +42,7 @@ The agent runs as a FastAPI web server on `http://127.0.0.1:8000` (localhost onl
 | LLM provider | OpenRouter **or** Ollama | Cloud (pay-per-token) or local (free) |
 | LLM client | `langchain-openai` / `langchain-ollama` | Swap backend via `LLM_BACKEND` env var |
 | Tool protocol | MCP (Model Context Protocol) | Standard tool interface |
-| MCP servers | `@modelcontextprotocol/server-filesystem`, `@playwright/mcp` | File + browser tools (Node/npx) |
+| MCP servers | `@modelcontextprotocol/server-filesystem` | File tools (Node/npx) |
 | Memory (history) | SQLite via SQLAlchemy | Per-session chat log + daily cost ledger |
 | Memory (recall) | ChromaDB (persistent, local) | Vector search of past turns for context recall |
 | Web server | FastAPI + Uvicorn | Async HTTP + WebSocket |
@@ -138,7 +138,7 @@ State: {messages, cost_spent, session_id, tool_calls_made}
 
 `MCPManager` (mcp_manager.py) spawns each MCP server as a subprocess via stdio:
 - `npx -y @modelcontextprotocol/server-filesystem "C:\Personal ai agent"` → 14 file tools
-- `npx -y @playwright/mcp` → 23 browser tools (headed mode)
+- `npx -y @modelcontextprotocol/server-filesystem` → file read/write tools
 
 Each server runs a `ClientSession` (MCP Python SDK). `MCPManager.list_tools_async()` collects all tools; `call_tool(name, args)` routes to the owning server.
 
@@ -241,7 +241,6 @@ daily_cost_usd: ${DAILY_COST_USD}
 
 mcp:
   filesystem:                  # npx server, args list
-  playwright:                  # npx server, headed by default
 
 memory:
   sqlite: ${DATA_DIR}/history.db
@@ -336,22 +335,13 @@ pm2 save                    # update the saved snapshot
 - **"List the files in the current directory"** → uses `list_directory` filesystem tool
 - **"Read the contents of README.md"** → uses `read_text_file`
 - **"Create a new folder called `scratch`"** → uses `create_directory`
-- **"Open https://example.com and tell me the page title"** → uses `browser_navigate` + `browser_snapshot`
-- **"Search the web for the latest Python version"** → uses browser navigation + extraction
+- **"Open Notepad and type a message"** → uses computer control (click, type_text)
 - **"What did we talk about earlier?"** → recall pulls past turns from ChromaDB
 
 ### Tool categories available
 
 **Filesystem (14 tools):** `read_file`, `read_text_file`, `read_media_file`, `read_multiple_files`, `write_file`, `edit_file`, `create_directory`, `list_directory`, `list_directory_with_sizes`, `directory_tree`, `move_file`, `search_files`, `get_file_info`, `list_allowed_directories`
 
-**Browser/Playwright (23 tools):** `browser_navigate`, `browser_navigate_back`, `browser_click`, `browser_type`, `browser_fill_form`, `browser_press_key`, `browser_select_option`, `browser_hover`, `browser_drag`, `browser_drop`, `browser_take_screenshot`, `browser_snapshot`, `browser_evaluate`, `browser_console_messages`, `browser_handle_dialog`, `browser_file_upload`, `browser_tabs`, `browser_resize`, `browser_close`, `browser_wait_for`, `browser_network_requests`, `browser_network_request`, `browser_run_code_unsafe`
-
-The LLM chooses which tool to call based on your message and the tool descriptions. You don't pick tools manually.
-
-### Behavior notes
-
-- **Filesystem scope:** limited to `C:\Personal ai agent\` (set in config.yaml MCP args). The agent cannot read/write outside this folder.
-- **Browser mode:** Playwright MCP runs **headed** by default — you'll see a Chrome window open when the agent browses. This is intentional for debugging. To run headless, add `--headless` to the playwright args in `config.yaml`.
 - **Destructive actions:** per persona, the agent should confirm before deleting/overwriting. Watch the chat for confirmation prompts.
 - **Multi-turn context:** last 20 SQLite messages + up to 3 vector-recalled past turns are sent as context each turn. Long conversations naturally include recent context.
 
@@ -440,8 +430,7 @@ pm2_logs\agent.err.log    # stderr (Python logging, tracebacks, MCP stderr)
 ### Key log lines to look for
 
 - `MCP server 'filesystem' started, 14 tools: [...]` — MCP boot OK
-- `MCP server 'playwright' started, 23 tools: [...]` — browser MCP OK
-- `AgentGraph ready. tools=37` — graph compiled, server accepting connections
+- `AgentGraph ready. tools=14` — graph compiled, server accepting connections
 - `Application startup complete.` — FastAPI lifespan done, /health is live
 - `127.0.0.1:xxxx - "GET /health HTTP/1.1" 200 OK` — health check hit
 - `127.0.0.1:xxxx - "GET /chat WebSocket"` — WS connection
@@ -565,8 +554,7 @@ Windows can't easily run `pm2 startup` (needs admin). This VBS script is a worka
 ### MCP server fails to start
 
 - **filesystem:** check `npx -y @modelcontextprotocol/server-filesystem --help` works. Node must be installed.
-- **playwright:** `@playwright/mcp` must be reachable via npx. Try `npx -y @playwright/mcp --help` manually. If it 404s, clear npm cache: `npm cache clean --force`.
-- **"Connection closed"** in logs — the MCP server subprocess crashed. Check that the npm package name in `config.yaml` is exactly right (we already fixed `@playwright/mcp-server` → `@playwright/mcp` and removed `--headed` which isn't a valid flag).
+- **"Connection closed"** in logs — the MCP server subprocess crashed. Check that the npm package name in `config.yaml` is exactly right.
 
 ### Chat returns "Daily cost cap reached"
 
@@ -576,11 +564,6 @@ Windows can't easily run `pm2 startup` (needs admin). This VBS script is a worka
   ```
   Or just delete `data/history.db` and restart (wipes chat history too).
 - To raise the cap: edit `DAILY_COST_USD` in `.env` or `daily_cost_usd` in `config.yaml`, then `pm2 restart ai-agent`.
-
-### Browser tool opens Chrome but does nothing
-
-- Playwright MCP needs a browser installed. First run may prompt to install Chromium. Run `npx -y @playwright/mcp` once manually to trigger install, then retry.
-- Headed mode: you'll see the browser window. If it hangs, the LLM may have called a tool that waits for a dialog or navigation that didn't complete. Restart the agent: `pm2 restart ai-agent`.
 
 ### Chat returns empty text
 
@@ -627,7 +610,6 @@ Edit `config.yaml`:
 ```yaml
 mcp:
   filesystem: { ... }
-  playwright: { ... }
   github:
     command: npx
     args:
