@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Personal AI Agent</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: system-ui, -apple-system, sans-serif; background: #1a1a2e; color: #e0e0e0; height: 100vh; display: flex; flex-direction: column; }
+  header { background: #16213e; padding: 12px 20px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #0f3460; }
+  header h1 { font-size: 18px; font-weight: 600; }
+  #status { font-size: 12px; color: #8a8a9a; }
+  #status .ok { color: #4ecca3; }
+  #messages { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 12px; }
+  .msg { max-width: 80%; padding: 10px 14px; border-radius: 12px; line-height: 1.5; font-size: 14px; white-space: pre-wrap; word-wrap: break-word; }
+  .msg.user { align-self: flex-end; background: #0f3460; color: #e0e0e0; }
+  .msg.assistant { align-self: flex-start; background: #2a2a4e; color: #e0e0e0; }
+  .msg.error { align-self: center; background: #4a1a1a; color: #ff8a8a; font-size: 13px; }
+  .msg.thinking { align-self: flex-start; color: #8a8a9a; font-style: italic; font-size: 13px; }
+  .trace { align-self: stretch; background: #121b31; border: 1px solid #274060; border-radius: 10px; overflow: hidden; }
+  .trace-header { display: flex; justify-content: space-between; align-items: center; padding: 9px 12px; background: #17243f; color: #9fc4ff; font-size: 13px; font-weight: 600; }
+  .trace-events { display: flex; flex-direction: column; gap: 6px; padding: 8px; }
+  .trace-event { background: #18233a; border: 1px solid #263a5e; border-radius: 7px; }
+  .trace-event summary { cursor: pointer; padding: 8px 10px; color: #d6e5ff; font-size: 12px; list-style: none; }
+  .trace-event summary::-webkit-details-marker { display: none; }
+  .trace-event summary::before { content: '›'; display: inline-block; margin-right: 7px; color: #4ecca3; transition: transform .15s ease; }
+  .trace-event[open] summary::before { transform: rotate(90deg); }
+  .trace-event pre { margin: 0; padding: 0 10px 10px 25px; max-height: 360px; overflow: auto; color: #c7d3e8; font: 12px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
+  .trace-event.failed { border-color: #8b4040; }
+  .trace-event.failed summary { color: #ff9f9f; }
+  #input-bar { background: #16213e; padding: 12px 20px; border-top: 1px solid #0f3460; display: flex; gap: 10px; }
+  #input { flex: 1; background: #1a1a2e; border: 1px solid #0f3460; color: #e0e0e0; padding: 10px 14px; border-radius: 8px; font-size: 14px; outline: none; }
+  #input:focus { border-color: #4ecca3; }
+  #send { background: #0f3460; color: #4ecca3; border: none; padding: 10px 20px; border-radius: 8px; cursor: pointer; font-size: 14px; font-weight: 600; }
+  #send:hover { background: #1a4a8a; }
+  #send:disabled { opacity: 0.5; cursor: not-allowed; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Personal AI Agent</h1>
+  <div id="status">connecting...</div>
+</header>
+<div id="messages"></div>
+<div id="input-bar">
+  <input id="input" type="text" placeholder="Message your agent..." autocomplete="off" />
+  <button id="send">Send</button>
+</div>
+<script>
+const ws = new WebSocket(`ws://${location.host}/chat`);
+const msgs = document.getElementById('messages');
+const input = document.getElementById('input');
+const sendBtn = document.getElementById('send');
+const status = document.getElementById('status');
+let busy = false;
+let activeTrace = null;
+
+function setBusy(b) { busy = b; sendBtn.disabled = b; input.disabled = b; if (!b) input.focus(); }
+
+function addMsg(type, text) {
+  const d = document.createElement('div');
+  d.className = 'msg ' + type;
+  d.textContent = text;
+  msgs.appendChild(d);
+  msgs.scrollTop = msgs.scrollHeight;
+  return d;
+}
+
+function scrollToBottom() {
+  msgs.scrollTop = msgs.scrollHeight;
+}
+
+function ensureTracePanel() {
+  if (activeTrace) return activeTrace;
+  const panel = document.createElement('section');
+  panel.className = 'trace';
+  const header = document.createElement('div');
+  header.className = 'trace-header';
+  const title = document.createElement('span');
+  title.textContent = 'Execution trace';
+  const summary = document.createElement('span');
+  summary.textContent = 'waiting for agent';
+  header.append(title, summary);
+  const events = document.createElement('div');
+  events.className = 'trace-events';
+  panel.append(header, events);
+  msgs.appendChild(panel);
+  activeTrace = { panel, summary, events, count: 0 };
+  scrollToBottom();
+  return activeTrace;
+}
+
+function traceTitle(event) {
+  const duration = event.duration_ms === undefined ? '' : ` · ${event.duration_ms} ms`;
+  switch (event.type) {
+    case 'turn_started': return 'Turn started';
+    case 'turn_completed': return `Turn completed${duration}`;
+    case 'turn_blocked': return `Turn blocked: ${event.reason || 'unknown reason'}`;
+    case 'turn_failed': return `Turn failed: ${event.error_type || 'unknown error'}${duration}`;
+    case 'memory_recall_started': return 'Memory recall started';
+    case 'memory_recall_completed': return `Memory recall: ${event.matches || 0} matches${duration}`;
+    case 'memory_history_loaded': return `Chat history: ${event.messages || 0} messages${duration}`;
+    case 'memory_persisted': return `Memory persisted${duration}`;
+    case 'llm_started': return `LLM request #${event.llm_call} · ${event.model || 'model'}`;
+    case 'llm_completed': return `LLM output #${event.llm_call}${duration}`;
+    case 'llm_failed': return `LLM failed: ${event.error_type || 'unknown error'}${duration}`;
+    case 'tool_started': return `Tool command: ${event.tool_name}`;
+    case 'tool_completed': return `Tool output: ${event.tool_name}${event.is_error ? ' (reported error)' : ''}${duration}`;
+    case 'tool_failed': return `Tool failed: ${event.tool_name} · ${event.error_type || 'unknown error'}${duration}`;
+    default: return event.type;
+  }
+}
+
+function tracePayload(event) {
+  const ignored = new Set(['type', 'sequence', 'timestamp', 'turn_id', 'duration_ms']);
+  const payload = {};
+  Object.entries(event).forEach(([key, value]) => {
+    if (!ignored.has(key)) payload[key] = value;
+  });
+  return JSON.stringify(payload, null, 2) || '{}';
+}
+
+function addTraceEvent(event) {
+  const trace = ensureTracePanel();
+  trace.count += 1;
+  trace.summary.textContent = `${trace.count} events · ${event.turn_id.slice(0, 8)}`;
+
+  const item = document.createElement('details');
+  item.className = 'trace-event';
+  item.open = true;
+  if (event.type.endsWith('failed') || event.is_error) item.classList.add('failed');
+  const title = document.createElement('summary');
+  title.textContent = traceTitle(event);
+  const payload = document.createElement('pre');
+  payload.textContent = tracePayload(event);
+  item.append(title, payload);
+  trace.events.appendChild(item);
+  scrollToBottom();
+}
+
+ws.onopen = () => {
+  status.innerHTML = '<span class="ok">● online</span>';
+  fetch('/health').then(r => r.json()).then(d => {
+    status.innerHTML = `<span class="ok">● online</span> · ${d.tools} tools · $${d.spent_today.toFixed(4)}/${d.daily_cap}`;
+  }).catch(() => {});
+};
+ws.onclose = () => { status.innerHTML = '● disconnected'; setBusy(true); };
+ws.onerror = () => { status.innerHTML = '● error'; };
+
+ws.onmessage = (e) => {
+  const data = JSON.parse(e.data);
+
+  if (data.type === 'thinking') {
+    addMsg('thinking', 'agent thinking...');
+    ensureTracePanel();
+  } else if (data.type === 'trace') {
+    addTraceEvent(data.event);
+  } else if (data.type === 'answer') {
+    msgs.querySelectorAll('.msg.thinking').forEach(t => t.remove());
+    addMsg('assistant', data.text);
+    status.innerHTML = `<span class="ok">● online</span> · $${data.spent_today.toFixed(4)}/${data.daily_cap}`;
+    setBusy(false);
+  } else if (data.type === 'error') {
+    msgs.querySelectorAll('.msg.thinking').forEach(t => t.remove());
+    addMsg('error', data.text);
+    setBusy(false);
+  }
+};
+
+function send() {
+  const text = input.value.trim();
+  if (!text || busy) return;
+  activeTrace = null;
+  addMsg('user', text);
+  input.value = '';
+  setBusy(true);
+  ws.send(JSON.stringify({ text, session_id: 'default' }));
+}
+
+sendBtn.onclick = send;
+input.onkeydown = (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } };
+input.focus();
+</script>
+</body>
+</html>

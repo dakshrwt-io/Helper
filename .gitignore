@@ -1,0 +1,30 @@
+# Code generation
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# Secrets / local
+.env
+data/
+*.db
+*.sqlite*
+
+# Logs
+*.log
+pm2_logs/
+
+# IDE
+.vscode/
+.idea/
+
+node_modules/
+.venv/
+.env
+__pycache__/
+*.pyc

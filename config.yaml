@@ -1,0 +1,43 @@
+llm:
+  backend: ${LLM_BACKEND}          # openrouter | ollama
+  openrouter:
+    model: ${MODEL}
+    api_key: ${OPENROUTER_API_KEY}
+    base_url: ${OPENROUTER_BASE_URL}
+  ollama:
+    model: ${OLLAMA_MODEL}
+    base_url: ${OLLAMA_BASE_URL}
+
+daily_cost_usd: ${DAILY_COST_USD}
+
+mcp:
+  filesystem:
+    command: npx
+    args:
+      - -y
+      - "@modelcontextprotocol/server-filesystem"
+      - "C:\\Personal ai agent"
+    transport: stdio
+  playwright:
+    command: npx
+    args:
+      - -y
+      - "@playwright/mcp"
+      - "--headless"
+      - "--executable-path"
+      - "C:\\Users\\daksh\\AppData\\Local\\ms-playwright\\chromium-1228\\chrome-win64\\chrome.exe"
+    transport: stdio
+
+memory:
+  sqlite: ${DATA_DIR}/history.db
+  chroma:  ${DATA_DIR}/chroma
+
+web:
+  port: ${WEB_PORT}
+  host: 127.0.0.1
+  auth: false
+
+agent:
+  persona_path: ${PERSONA_PATH}
+  temperature: 0.3
+  max_iterations: 25
