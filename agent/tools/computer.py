@@ -409,9 +409,9 @@ def get_computer_tools() -> list[StructuredTool]:
         # read-only — no confirmation needed
         _wrap_tool(
             "computer_screenshot",
-            "Capture a screenshot of the entire primary screen. Always call this "
-            "BEFORE any click/type/drag action so you can see what is on screen. "
-            "Call it AGAIN after actions to verify the result.",
+            "Capture a screenshot of the entire primary screen. Use this when you need "
+            "to see what is on screen — identifying UI elements, verifying an action "
+            "completed, or checking the current state.",
             BaseModel,
             _exec_screenshot,
         ),

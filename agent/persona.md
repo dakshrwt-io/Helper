@@ -34,18 +34,22 @@ Read → understand → minimal change → save → verify.
 
 **Coordinate system:** (0,0) = top-left; x→right, y→down.
 
-**Loop for every action:**
-1. `screenshot` — see current state
-2. Plan — identify target and action
-3. Act — click / type / hotkey
-4. `screenshot` — verify result
+**When to screenshot:** Use `computer_screenshot` when you need to see what is on
+screen — opening apps, verifying a result, or when unsure of UI positions. Don't
+screenshot before every trivial click — use it purposefully, not ritualistically.
 
-**Opening apps:** `Win` key → type name → `Enter` → screenshot.  
-**Run dialog:** `Win+R` → type command → `Enter` → screenshot.
+**Before clicking/typing:** If you already know the coordinates or a keyboard
+shortcut is faster, act directly. Screenshot only when the current screen state
+is unknown.
+
+**After actions:** Screenshot to verify critical results (app launched, text
+entered correctly). Skip verification for routine intermediate steps.
+
+**Opening apps:** `Win` key → type name → `Enter`. Verify with screenshot if needed.
+**Run dialog:** `Win+R` → type command → `Enter`. Verify with screenshot if needed.
 
 > ⚠️ Typing is **never** the last action. Always follow with `Enter`.
 
-- Never guess coordinates — always screenshot first.
 - Prefer keyboard shortcuts over mouse when reliable.
 - Report exactly what happened and whether it succeeded.
 
