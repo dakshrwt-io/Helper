@@ -73,15 +73,18 @@
   <button id="send">Send</button>
 </div>
 <script>
-const ws = new WebSocket(`ws://${location.host}/chat`);
+const wsUrl = `ws://${location.host}/chat`;
 const msgs = document.getElementById('messages');
 const input = document.getElementById('input');
 const sendBtn = document.getElementById('send');
 const status = document.getElementById('status');
+let ws;
 let busy = false;
 let activeTrace = null;
 let activeToolPanel = null;
 let pendingToolCard = null;
+let reconnectAttempts = 0;
+let reconnectTimer = null;
 
 function setBusy(b) { busy = b; sendBtn.disabled = b; input.disabled = b; if (!b) input.focus(); }
 
@@ -253,16 +256,7 @@ function addTraceEvent(event) {
   scrollToBottom();
 }
 
-ws.onopen = () => {
-  status.innerHTML = '<span class="ok">\u25cf online</span>';
-  fetch('/health').then(r => r.json()).then(d => {
-    status.innerHTML = `<span class="ok">\u25cf online</span> \u00b7 ${d.tools} tools \u00b7 $${d.spent_today.toFixed(4)}/${d.daily_cap}`;
-  }).catch(() => {});
-};
-ws.onclose = () => { status.innerHTML = '\u25cf disconnected'; setBusy(true); };
-ws.onerror = () => { status.innerHTML = '\u25cf error'; };
-
-ws.onmessage = (e) => {
+function handleMessage(e) {
   const data = JSON.parse(e.data);
 
   if (data.type === 'history') {
@@ -297,7 +291,31 @@ ws.onmessage = (e) => {
     addMsg('error', data.text);
     setBusy(false);
   }
-};
+}
+
+function connect() {
+  if (ws && ws.readyState === WebSocket.OPEN) return;
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  ws = new WebSocket(wsUrl);
+  ws.onopen = () => {
+    status.innerHTML = '<span class="ok">\u25cf online</span>';
+    reconnectAttempts = 0;
+    fetch('/health').then(r => r.json()).then(d => {
+      status.innerHTML = `<span class="ok">\u25cf online</span> \u00b7 ${d.tools} tools \u00b7 $${d.spent_today.toFixed(4)}/${d.daily_cap}`;
+    }).catch(() => {});
+    setBusy(false);
+  };
+  ws.onclose = () => {
+    status.innerHTML = '\u25cf disconnected';
+    setBusy(true);
+    const delay = Math.min(5000 * Math.pow(2, reconnectAttempts), 30000);
+    reconnectAttempts += 1;
+    status.innerHTML = `\u25cf reconnecting in ${Math.round(delay / 1000)}s...`;
+    reconnectTimer = setTimeout(connect, delay);
+  };
+  ws.onerror = () => { status.innerHTML = '\u25cf error'; };
+  ws.onmessage = handleMessage;
+}
 
 function send() {
   const text = input.value.trim();
@@ -313,7 +331,7 @@ function send() {
 
 sendBtn.onclick = send;
 input.onkeydown = (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } };
-input.focus();
+connect();
 </script>
 </body>
 </html>

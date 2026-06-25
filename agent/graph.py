@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 import yaml
@@ -18,10 +19,12 @@ from agent.mcp_manager import MCPManager
 from agent.memory.db import ChatDB
 from agent.memory.vector import VectorStore
 from agent.tools.computer import (
+    clear_screenshots,
     get_computer_tools,
     inject_screenshots,
     set_confirm_config,
 )
+from agent.shared import sanitize_aimessage
 from agent.trace import TraceCollector, activate_trace, display_content, duration_ms
 
 logger = logging.getLogger(__name__)
@@ -86,7 +89,7 @@ class AgentGraph:
 
     def _make_llm(self) -> None:
         """Build the LLM based on the configured backend."""
-        from langchain_openai import ChatOpenAI  # noqa: F811
+        from langchain_openai import ChatOpenAI
 
         llm_cfg = self._cfg.get("llm", {})
         self._llm_backend = llm_cfg.get("backend", "openrouter").lower()
@@ -105,11 +108,33 @@ class AgentGraph:
         elif self._llm_backend == "deepseek":
             ocfg = llm_cfg.get("deepseek", {})
             self._model_name = ocfg.get("model", "deepseek-v4-flash")
+            model_kwargs: dict[str, Any] = {}
+            extra_body: dict[str, Any] = {}
+            if str(ocfg.get("thinking", "")).lower() == "true":
+                extra_body["thinking"] = {"type": "enabled"}
+            reasoning = ocfg.get("reasoning_effort", "")
+            if reasoning:
+                extra_body["reasoning_effort"] = reasoning
+            if extra_body:
+                model_kwargs["extra_body"] = extra_body
             self._llm = ChatOpenAI(
                 model=self._model_name,
                 openai_api_key=ocfg.get("api_key", ""),
                 openai_api_base=ocfg.get("base_url", "https://api.deepseek.com"),
                 temperature=temperature,
+                model_kwargs=model_kwargs if model_kwargs else None,
+            )
+        elif self._llm_backend == "nvidia":
+            from langchain_nvidia_ai_endpoints import ChatNVIDIA
+
+            ocfg = llm_cfg.get("nvidia", {})
+            self._model_name = ocfg.get("model", "minimaxai/minimax-m3")
+            self._llm = ChatNVIDIA(
+                model=self._model_name,
+                api_key=ocfg.get("api_key", ""),
+                temperature=float(ocfg.get("temperature", temperature)),
+                top_p=float(ocfg.get("top_p", 0.95)),
+                max_completion_tokens=int(ocfg.get("max_completion_tokens", 8192)),
             )
         else:
             ocfg = llm_cfg.get("openrouter", {})
@@ -132,31 +157,6 @@ class AgentGraph:
                 temperature=0.0,
             )
             logger.info("Groq vision LLM ready: %s", self._groq_model)
-
-    _STRIP_ADDITIONAL_KW = frozenset({"reasoning_content", "reasoning_details"})
-
-    @staticmethod
-    def _sanitize_messages(messages: list[Any]) -> list[Any]:
-        """Return a copy of *messages* with provider-specific ``additional_kwargs``
-        stripped from every ``AIMessage`` (e.g. ``reasoning_content`` from DeepSeek
-        which Groq / other backends reject).
-        """
-        out: list[Any] = []
-        for m in messages:
-            if isinstance(m, AIMessage) and (
-                bad := AgentGraph._STRIP_ADDITIONAL_KW.intersection(
-                    m.additional_kwargs or {}
-                )
-            ):
-                ak = {
-                    k: v
-                    for k, v in m.additional_kwargs.items()
-                    if k not in AgentGraph._STRIP_ADDITIONAL_KW
-                }
-                out.append(m.model_copy(update={"additional_kwargs": ak}))
-            else:
-                out.append(m)
-        return out
 
     async def setup(self) -> None:
         """Async init: load config, start MCP, build LLM+tools+graph."""
@@ -183,8 +183,10 @@ class AgentGraph:
         async def agent_node(state: AgentState) -> dict[str, Any]:
             msgs = list(state.get("messages", []))
             if not msgs or not isinstance(msgs[0], SystemMessage):
-                msgs = [SystemMessage(content=self._persona)] + msgs
-            msgs = AgentGraph._sanitize_messages(msgs)
+                current_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                persona_with_time = f"{self._persona}\n\nCurrent datetime: {current_time}"
+                msgs = [SystemMessage(content=persona_with_time)] + msgs
+            msgs = [sanitize_aimessage(m) if isinstance(m, AIMessage) else m for m in msgs]
             trace = state.get("trace")
             llm_call = state.get("llm_calls_made", 0) + 1
 
@@ -238,6 +240,12 @@ class AgentGraph:
                         error=str(exc),
                     )
                 raise
+            reasoning = getattr(resp, "additional_kwargs", {}) or {}
+            reasoning_text = reasoning.get("reasoning_content", "")
+            if reasoning_text:
+                if trace:
+                    trace.emit("reasoning", content=reasoning_text)
+                resp = resp.model_copy(update={"content": f"[Thinking]\n{reasoning_text}\n\n{resp.content}"})
             cost = state.get("cost_spent", 0.0)
             tc = state.get("tool_calls_made", 0)
             if self._llm_backend != "ollama":
@@ -307,6 +315,7 @@ class AgentGraph:
 
         with activate_trace(trace):
             trace.emit("turn_started", session_id=session_id)
+            clear_screenshots()
             try:
                 # 0. cost guard: hard stop if daily cap already hit
                 if self._chatdb and self._chatdb.spent_today() >= self._daily_cap:

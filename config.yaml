@@ -1,5 +1,5 @@
 llm:
-  backend: ${LLM_BACKEND}          # openrouter | ollama | deepseek
+  backend: ${LLM_BACKEND}          # openrouter | ollama | deepseek | nvidia
   openrouter:
     model: ${MODEL}
     api_key: ${OPENROUTER_API_KEY}
@@ -13,6 +13,12 @@ llm:
     base_url: ${DEEPSEEK_BASE_URL}
     thinking: ${DEEPSEEK_THINKING}
     reasoning_effort: ${DEEPSEEK_REASONING_EFFORT}
+  nvidia:
+    model: ${NVIDIA_MODEL}
+    api_key: ${NVIDIA_API_KEY}
+    temperature: ${NVIDIA_TEMPERATURE}
+    top_p: ${NVIDIA_TOP_P}
+    max_completion_tokens: ${NVIDIA_MAX_TOKENS}
   groq:
     model: ${GROQ_MODEL}
     api_key: ${GROQ_API_KEY}

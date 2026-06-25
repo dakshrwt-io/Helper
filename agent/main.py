@@ -115,17 +115,14 @@ async def chat_ws(ws: WebSocket):
                 async with ws_lock:
                     await ws.send_json(event)
             except Exception:
+                logger.exception("chat bus forwarder error")
                 break
 
     fwd_task = asyncio.create_task(_forwarder())
+    _history_sent: dict[str, bool] = {}
 
     try:
         graph = get_graph()
-        if graph and graph._chatdb:
-            history = graph._chatdb.get_history("default", limit=50)
-            if history:
-                async with ws_lock:
-                    await ws.send_json({"type": "history", "messages": history})
 
         while True:
             raw = await ws.receive_text()
@@ -141,6 +138,13 @@ async def chat_ws(ws: WebSocket):
                 async with ws_lock:
                     await ws.send_json({"type": "error", "text": "Empty message"})
                 continue
+
+            if graph and graph._chatdb and not _history_sent.get(session_id):
+                _history_sent[session_id] = True
+                history = graph._chatdb.get_history(session_id, limit=50)
+                if history:
+                    async with ws_lock:
+                        await ws.send_json({"type": "history", "messages": history})
 
             while not bus_queue.empty():
                 try:

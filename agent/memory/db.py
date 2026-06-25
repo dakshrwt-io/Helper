@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 from datetime import datetime, timezone
 
-from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine
+from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine, select
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 
@@ -46,13 +46,12 @@ class ChatDB:
     def get_history(self, session_id: str, limit: int = 50) -> list[dict]:
         s = self.Session()
         try:
-            rows = (
-                s.query(MessageRow)
+            rows = s.scalars(
+                select(MessageRow)
                 .filter_by(session_id=session_id)
                 .order_by(MessageRow.id.desc())
                 .limit(limit)
-                .all()
-            )
+            ).all()
             return [{"role": r.role, "content": r.content, "ts": str(r.ts)} for r in reversed(rows)]
         finally:
             s.close()
@@ -64,7 +63,7 @@ class ChatDB:
         d = self.today_str()
         s = self.Session()
         try:
-            row = s.query(CostRow).filter_by(date=d).first()
+            row = s.scalar(select(CostRow).filter_by(date=d))
             if row:
                 row.spent += micro_usd
             else:
@@ -77,7 +76,7 @@ class ChatDB:
         d = self.today_str()
         s = self.Session()
         try:
-            row = s.query(CostRow).filter_by(date=d).first()
+            row = s.scalar(select(CostRow).filter_by(date=d))
             return (row.spent / 1_000_000.0) if row else 0.0
         finally:
             s.close()

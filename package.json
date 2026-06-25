@@ -1,3 +1,5 @@
 {
-  "dependencies": {}
+  "dependencies": {
+    "playwright-chromium": "^1.61.0"
+  }
 }

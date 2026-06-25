@@ -7,9 +7,15 @@ from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from typing import Any
 
+from typing import Literal
+
 import yaml
 from mcp import ClientSession, StdioServerParameters, stdio_client
-from mcp.types import Tool as MCPTool
+from mcp.types import CallToolResult, ImageContent, Tool as MCPTool
+
+ImageContent.model_fields["type"].annotation = Literal["image", "blob"]
+ImageContent.model_rebuild(force=True)
+CallToolResult.model_rebuild(force=True)
 
 logger = logging.getLogger(__name__)
 
@@ -30,12 +36,32 @@ class MCPManager:
         self._servers: dict[str, MCPServerConfig] = {}
         self._sessions: dict[str, ClientSession] = {}
         self._exit_stack: AsyncExitStack | None = None
-        self._tools: dict[str, MCPTool] = {}  # tool_name -> server_name
+        self._tools: dict[str, str] = {}  # tool_name -> server_name
         self._loaded = False
 
     def _load_config(self) -> dict[str, Any]:
         with open(self.config_path, "r", encoding="utf-8") as f:
-            return yaml.safe_load(f)
+            raw = yaml.safe_load(f)
+        self._expand(raw)
+        return raw
+
+    @staticmethod
+    def _expand(obj: Any) -> None:
+        import os
+        if isinstance(obj, str):
+            pass  # string values don't need in-place expansion
+        elif isinstance(obj, dict):
+            for k, v in obj.items():
+                if isinstance(v, str):
+                    obj[k] = os.path.expandvars(v)  # type: ignore[arg-type]
+                else:
+                    MCPManager._expand(v)
+        elif isinstance(obj, list):
+            for i, v in enumerate(obj):
+                if isinstance(v, str):
+                    obj[i] = os.path.expandvars(v)  # type: ignore[index]
+                else:
+                    MCPManager._expand(v)
 
     def _parse_servers(self, raw: dict[str, Any]) -> None:
         for name, cfg in raw.items():
@@ -80,14 +106,6 @@ class MCPManager:
                 logger.error("Failed to start MCP server '%s': %s", name, e)
 
         self._loaded = True
-
-    def list_tools(self) -> list[MCPTool]:
-        """Return all available MCP tools across servers (synchronous snapshot)."""
-        out: list[MCPTool] = []
-        for name, session in self._sessions.items():
-            # list_tools is async; we cache from start(). Re-fetch lazily.
-            pass
-        return out
 
     async def list_tools_async(self) -> list[MCPTool]:
         """Fetch current tool list from all live sessions."""

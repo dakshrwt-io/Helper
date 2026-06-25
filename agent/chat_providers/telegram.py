@@ -199,11 +199,7 @@ async def reset_cmd(update: Update, _context: Any) -> None:
     if not authorized:
         await _send_safe(update, f"\U0001f512 *Access denied*\nYour Telegram user ID: `{tg_id or 'unknown'}`\nAdd it to TELEGRAM_ALLOWED_USERS in your \\.env file\\.")
         return
-    import time
-
-    new_id = f"telegram_{update.effective_chat.id}_{int(time.time())}"
-    if "session_id" not in (update.effective_chat.__dict__ if hasattr(update.effective_chat, "__dict__") else {}):
-        pass
+    _context.user_data.pop("session_id", None)
     await _send_safe(update, "Conversation reset\\. The agent will not remember previous messages from this chat\\.")
 
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import json
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -44,12 +45,15 @@ class TraceCollector:
     turn_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     events: list[dict[str, Any]] = field(default_factory=list)
     _sequence: int = 0
+    _seq_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def emit(self, event_type: str, **payload: Any) -> dict[str, Any]:
-        self._sequence += 1
+        with self._seq_lock:
+            self._sequence += 1
+            seq = self._sequence
         event = {
             "type": event_type,
-            "sequence": self._sequence,
+            "sequence": seq,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "turn_id": self.turn_id,
             **_json_safe(payload),

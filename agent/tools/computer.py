@@ -20,6 +20,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
 
+from agent.shared import sanitize_aimessage
 from agent.trace import duration_ms, get_active_trace
 
 logger = logging.getLogger(__name__)
@@ -59,31 +60,18 @@ def _pop_screenshot() -> str | None:
     return None
 
 
-_STRIP_KEYS = frozenset({"reasoning_content", "reasoning_details"})
-
-
-def _sanitize_additional_kwargs(m: AIMessage) -> AIMessage:
-    """Return a copy of *m* with provider-specific ``additional_kwargs`` stripped."""
-    ak = {
-        k: v
-        for k, v in (m.additional_kwargs or {}).items()
-        if k not in _STRIP_KEYS
-    }
-    if len(ak) == len(m.additional_kwargs or {}):
-        return m  # no change, reuse original
-    return m.model_copy(update={"additional_kwargs": ak})
+def clear_screenshots() -> None:
+    _screenshots.clear()
+    return None
 
 
 def inject_screenshots(messages: list[Any]) -> list[Any]:
     """Wrap ``computer_screenshot`` ToolMessages with a follow-up HumanMessage
     carrying the image, as Groq and some vision APIs reject images in ToolMessages.
-
-    Also strips provider-specific ``additional_kwargs`` fields
-    (e.g. ``reasoning_content`` from DeepSeek) that other backends reject.
     """
     result: list[Any] = []
     for m in messages:
-        clean = _sanitize_additional_kwargs(m) if isinstance(m, AIMessage) else m
+        clean = sanitize_aimessage(m) if isinstance(m, AIMessage) else m
         result.append(clean)
         if isinstance(m, ToolMessage) and getattr(m, "name", None) == "computer_screenshot":
             b64 = _pop_screenshot()
@@ -278,7 +266,7 @@ class _RightClickArgs(BaseModel):
 
 async def _exec_screenshot(**kwargs: Any) -> str:
     _ensure_pyautogui()
-    img = pyautogui.screenshot()
+    img = await asyncio.to_thread(pyautogui.screenshot)
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=True)
     b64 = base64.b64encode(buf.getvalue()).decode()
@@ -288,13 +276,13 @@ async def _exec_screenshot(**kwargs: Any) -> str:
 
 async def _exec_get_screen_size(**kwargs: Any) -> str:
     _ensure_pyautogui()
-    w, h = pyautogui.size()
+    w, h = await asyncio.to_thread(pyautogui.size)
     return f"Screen size: {w}\u00d7{h} (primary monitor)"
 
 
 async def _exec_get_mouse_position(**kwargs: Any) -> str:
     _ensure_pyautogui()
-    x, y = pyautogui.position()
+    x, y = await asyncio.to_thread(pyautogui.position)
     return f"Mouse position: ({x}, {y})"
 
 
@@ -304,7 +292,7 @@ async def _exec_move_mouse(x: int, y: int) -> str:
         if not await wait_for_confirmation(cid):
             return "Action denied by user."
     _ensure_pyautogui()
-    pyautogui.moveTo(x, y)
+    await asyncio.to_thread(pyautogui.moveTo, x, y)
     return f"Moved mouse to ({x}, {y})"
 
 
@@ -314,7 +302,7 @@ async def _exec_click(x: int, y: int, button: str = "left") -> str:
         if not await wait_for_confirmation(cid):
             return "Action denied by user."
     _ensure_pyautogui()
-    pyautogui.click(x, y, button=button)
+    await asyncio.to_thread(pyautogui.click, x, y, button=button)
     return f"Clicked {button} at ({x}, {y})"
 
 
@@ -324,7 +312,7 @@ async def _exec_double_click(x: int, y: int) -> str:
         if not await wait_for_confirmation(cid):
             return "Action denied by user."
     _ensure_pyautogui()
-    pyautogui.doubleClick(x, y)
+    await asyncio.to_thread(pyautogui.doubleClick, x, y)
     return f"Double-clicked at ({x}, {y})"
 
 
@@ -334,7 +322,7 @@ async def _exec_right_click(x: int, y: int) -> str:
         if not await wait_for_confirmation(cid):
             return "Action denied by user."
     _ensure_pyautogui()
-    pyautogui.rightClick(x, y)
+    await asyncio.to_thread(pyautogui.rightClick, x, y)
     return f"Right-clicked at ({x}, {y})"
 
 
@@ -345,7 +333,7 @@ async def _exec_type_text(text: str, interval: float = 0.05) -> str:
         if not await wait_for_confirmation(cid):
             return "Action denied by user."
     _ensure_pyautogui()
-    pyautogui.write(text, interval=interval)
+    await asyncio.to_thread(pyautogui.write, text, interval=interval)
     preview = text if len(text) <= 60 else text[:57] + "..."
     return f"Typed: {preview}"
 
@@ -356,7 +344,7 @@ async def _exec_press_key(key: str) -> str:
         if not await wait_for_confirmation(cid):
             return "Action denied by user."
     _ensure_pyautogui()
-    pyautogui.press(key)
+    await asyncio.to_thread(pyautogui.press, key)
     return f"Pressed key: {key}"
 
 
@@ -367,9 +355,9 @@ async def _exec_hotkey(keys: str) -> str:
             return "Action denied by user."
     _ensure_pyautogui()
     combo = [k.strip().lower() for k in keys.split("+")]
-    pyautogui.hotkey(*combo)
+    await asyncio.to_thread(pyautogui.hotkey, *combo)
     if "win" in combo:
-        time.sleep(0.3)
+        await asyncio.sleep(0.3)
     return f"Pressed hotkey: {keys}"
 
 
@@ -379,7 +367,7 @@ async def _exec_scroll(clicks: int) -> str:
         if not await wait_for_confirmation(cid):
             return "Action denied by user."
     _ensure_pyautogui()
-    pyautogui.scroll(clicks)
+    await asyncio.to_thread(pyautogui.scroll, clicks)
     direction = "up" if clicks > 0 else "down"
     return f"Scrolled {direction} by {abs(clicks)} clicks"
 
@@ -395,8 +383,8 @@ async def _exec_drag(
         if not await wait_for_confirmation(cid):
             return "Action denied by user."
     _ensure_pyautogui()
-    pyautogui.moveTo(start_x, start_y)
-    pyautogui.drag(end_x - start_x, end_y - start_y, duration=duration)
+    await asyncio.to_thread(pyautogui.moveTo, start_x, start_y)
+    await asyncio.to_thread(pyautogui.drag, end_x - start_x, end_y - start_y, duration=duration)
     return f"Dragged from ({start_x}, {start_y}) to ({end_x}, {end_y})"
 
 

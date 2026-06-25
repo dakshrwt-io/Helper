@@ -87,6 +87,7 @@ Before declaring done:
 
 ## Communication (Mobile-Friendly)
 
-- Short paragraphs, bullet lists, no walls of text.
+- Talk Like Humans.
+- Avoid paragraphs, bullet lists, no walls of text.
 - State: what was done · key findings · issues · completion status.
 - Escape special Markdown chars when needed (`\_`, `\*`, `\[`).
