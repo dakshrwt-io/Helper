@@ -18,6 +18,7 @@ from agent.mcp_adapter import build_langchain_tools
 from agent.mcp_manager import MCPManager
 from agent.memory.db import ChatDB
 from agent.memory.vector import VectorStore
+from agent.subagents import SubAgentManager, build_task_tool
 from agent.tools.computer import (
     clear_screenshots,
     get_computer_tools,
@@ -32,11 +33,11 @@ logger = logging.getLogger(__name__)
 
 class AgentState(TypedDict, total=False):
     messages: list[Any]
-    cost_spent: float
     session_id: str
     tool_calls_made: int
     llm_calls_made: int
     trace: TraceCollector
+    started_at: float
 
 
 class AgentGraph:
@@ -53,13 +54,13 @@ class AgentGraph:
         self._graph = None
         self._persona: str = ""
         self._cfg: dict[str, Any] = {}
-        self._daily_cap: float = 1.0
         self._chatdb: ChatDB | None = None
         self._vector: VectorStore | None = None
         self._llm_backend: str = "openrouter"
         self._model_name: str = ""
         self._groq_llm: Any = None
         self._groq_model: str = ""
+        self._subagent_manager: SubAgentManager | None = None
 
     def _load(self) -> None:
         with open(self.config_path, "r", encoding="utf-8") as f:
@@ -82,10 +83,23 @@ class AgentGraph:
                 self._persona = f.read()
         except OSError:
             self._persona = "You are a helpful personal AI assistant."
-        self._daily_cap = float(self._cfg.get("daily_cost_usd", 1.0))
         mem = self._cfg.get("memory", {})
         self._chatdb = ChatDB(os.path.expandvars(mem.get("sqlite", "data/history.db")))
         self._vector = VectorStore(os.path.expandvars(mem.get("chroma", "data/chroma")))
+
+        if self._vector.count() == 0:
+            turns = self._chatdb.export_all_turns()
+            if turns:
+                logger.info(
+                    "Vector store is empty — rebuilding from %d SQLite turns",
+                    len(turns),
+                )
+                import uuid
+                self._vector.rebuild(
+                    ids=[str(uuid.uuid4()) for _ in turns],
+                    texts=[t["text"] for t in turns],
+                    metas=[{"session_id": t["session_id"]} for t in turns],
+                )
 
     def _make_llm(self) -> None:
         """Build the LLM based on the configured backend."""
@@ -162,6 +176,8 @@ class AgentGraph:
         """Async init: load config, start MCP, build LLM+tools+graph."""
         self._load()
         await self.mcp.start()
+        self._make_llm()
+
         tools = await build_langchain_tools(self.mcp)
 
         cc = self._cfg.get("computer_control", {})
@@ -172,13 +188,25 @@ class AgentGraph:
             )
             tools.extend(get_computer_tools())
 
-        self._make_llm()
+        if self._cfg.get("subagents", {}).get("enabled", True):
+            self._subagent_manager = SubAgentManager(
+                raw_config=self._cfg,
+                mcp_tools=[t for t in tools if not t.name.startswith("computer_")],
+                computer_tools=[t for t in tools if t.name.startswith("computer_")],
+                llm=self._llm,
+                llm_backend=self._llm_backend,
+                model_name=self._model_name,
+            )
+            if self._subagent_manager.agent_names:
+                tools.append(build_task_tool(self._subagent_manager, self._chatdb))
+
         self._llm_with_tools = self._llm.bind_tools(tools) if tools else self._llm
         self._tools_node = ToolNode(tools) if tools else None
         self._build_graph()
 
     def _build_graph(self) -> None:
         max_iter = int(self._cfg.get("agent", {}).get("max_iterations", 15))
+        max_secs = float(self._cfg.get("agent", {}).get("max_seconds", 120))
 
         async def agent_node(state: AgentState) -> dict[str, Any]:
             msgs = list(state.get("messages", []))
@@ -246,17 +274,8 @@ class AgentGraph:
                 if trace:
                     trace.emit("reasoning", content=reasoning_text)
                 resp = resp.model_copy(update={"content": f"[Thinking]\n{reasoning_text}\n\n{resp.content}"})
-            cost = state.get("cost_spent", 0.0)
             tc = state.get("tool_calls_made", 0)
-            if self._llm_backend != "ollama":
-                usage = getattr(resp, "usage_metadata", None)
-                if usage:
-                    total = usage.get("total_tokens") or (
-                        usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
-                    )
-                    cost += float(total) * 0.000002
-            else:
-                usage = getattr(resp, "usage_metadata", None)
+            usage = getattr(resp, "usage_metadata", None)
             if trace:
                 trace.emit(
                     "llm_completed",
@@ -268,7 +287,6 @@ class AgentGraph:
                 )
             return {
                 "messages": msgs + [resp],
-                "cost_spent": cost,
                 "tool_calls_made": tc,
                 "llm_calls_made": llm_call,
             }
@@ -283,10 +301,12 @@ class AgentGraph:
             return {"messages": msgs, "tool_calls_made": state.get("tool_calls_made", 0) + 1}
 
         def route(state: AgentState) -> str:
-            if state.get("cost_spent", 0.0) >= self._daily_cap:
-                return END
             if state.get("tool_calls_made", 0) >= max_iter:
                 return END
+            if max_secs > 0 and state.get("started_at"):
+                elapsed = time.perf_counter() - state["started_at"]
+                if elapsed >= max_secs:
+                    return END
             msgs = state.get("messages", [])
             if not msgs:
                 return END
@@ -317,18 +337,6 @@ class AgentGraph:
             trace.emit("turn_started", session_id=session_id)
             clear_screenshots()
             try:
-                # 0. cost guard: hard stop if daily cap already hit
-                if self._chatdb and self._chatdb.spent_today() >= self._daily_cap:
-                    text = f"Daily cost cap (${self._daily_cap:.2f}) reached. Try again after UTC midnight."
-                    trace.emit("turn_blocked", reason="daily_cost_cap", daily_cap=self._daily_cap)
-                    trace.emit("turn_completed", duration_ms=duration_ms(turn_start), cost_spent=0.0)
-                    return {
-                        "text": text,
-                        "cost_spent": 0.0,
-                        "messages": [],
-                        "trace": trace.events,
-                    }
-
                 # 1. recall: fetch relevant past turns
                 recalled: list[str] = []
                 if self._vector:
@@ -369,11 +377,11 @@ class AgentGraph:
 
                 state: AgentState = {
                     "messages": msgs,
-                    "cost_spent": 0.0,
                     "session_id": session_id,
                     "tool_calls_made": 0,
                     "llm_calls_made": 0,
                     "trace": trace,
+                    "started_at": time.perf_counter(),
                 }
                 result = await self._graph.ainvoke(state)
                 out_msgs = result.get("messages", [])
@@ -395,9 +403,6 @@ class AgentGraph:
                 if self._chatdb:
                     self._chatdb.add_message(session_id, "user", user_text)
                     self._chatdb.add_message(session_id, "assistant", final)
-                    cost_usd = result.get("cost_spent", 0.0)
-                    if cost_usd > 0:
-                        self._chatdb.add_cost(int(cost_usd * 1_000_000))
                 if self._vector and final:
                     import uuid
                     uid = str(uuid.uuid4())
@@ -410,13 +415,11 @@ class AgentGraph:
                 trace.emit(
                     "turn_completed",
                     duration_ms=duration_ms(turn_start),
-                    cost_spent=result.get("cost_spent", 0.0),
                     llm_calls=result.get("llm_calls_made", 0),
                     tool_rounds=result.get("tool_calls_made", 0),
                 )
                 return {
                     "text": final,
-                    "cost_spent": result.get("cost_spent", 0.0),
                     "messages": out_msgs,
                     "trace": trace.events,
                 }

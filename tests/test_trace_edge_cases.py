@@ -20,13 +20,16 @@ class _FakeLLM:
         )
 
 
-def test_cost_cap_trace_emits_turn_blocked() -> None:
+def test_cost_cap_no_longer_blocks() -> None:
     async def run() -> None:
         agent = AgentGraph()
         agent._cfg = {"agent": {"max_iterations": 3}}
-        agent._daily_cap = 1.0
 
-        # fake chatdb that reports over-cap spend
+        agent._llm = _FakeLLM()
+        agent._llm_with_tools = agent._llm
+        agent._persona = "You are a test agent."
+        agent._build_graph()
+
         class FakeDB:
             def spent_today(self) -> float:
                 return 1.5
@@ -44,10 +47,10 @@ def test_cost_cap_trace_emits_turn_blocked() -> None:
         events = result["trace"]
         types = [e["type"] for e in events]
 
-        assert types == ["turn_started", "turn_blocked", "turn_completed"]
-        assert events[1]["reason"] == "daily_cost_cap"
-        assert "cap" in result["text"].lower() and "reached" in result["text"].lower()
-        assert queue.qsize() == len(events)
+        assert "turn_blocked" not in types
+        assert "turn_started" in types
+        assert "turn_completed" in types
+        assert result["text"] == "ok"
 
     asyncio.run(run())
 

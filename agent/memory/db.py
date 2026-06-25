@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 from datetime import datetime, timezone
 
-from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine, select
+from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine, event, select
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 
@@ -28,10 +28,16 @@ class CostRow(Base):
     spent = Column(Integer, default=0)  # micro-USD
 
 
+def _set_wal(dbapi_connection, _connection_record):
+    dbapi_connection.execute("PRAGMA journal_mode=WAL")
+    dbapi_connection.execute("PRAGMA busy_timeout=5000")
+
+
 class ChatDB:
     def __init__(self, path: str = "data/history.db") -> None:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         self.engine = create_engine(f"sqlite:///{path}")
+        event.listens_for(self.engine, "connect")(_set_wal)
         Base.metadata.create_all(self.engine)
         self.Session = sessionmaker(bind=self.engine)
 
@@ -80,3 +86,31 @@ class ChatDB:
             return (row.spent / 1_000_000.0) if row else 0.0
         finally:
             s.close()
+
+    def export_all_turns(self) -> list[dict]:
+        s = self.Session()
+        try:
+            rows = s.scalars(
+                select(MessageRow)
+                .order_by(MessageRow.id.asc())
+            ).all()
+        finally:
+            s.close()
+
+        turns: list[dict] = []
+        pending_user: MessageRow | None = None
+        for row in rows:
+            if row.role == "user":
+                if pending_user is not None:
+                    pending_user = row
+                else:
+                    pending_user = row
+            elif row.role == "assistant" and pending_user is not None:
+                user_text = pending_user.content or ""
+                assistant_text = row.content or ""
+                turns.append({
+                    "session_id": row.session_id,
+                    "text": f"User: {user_text}\nAssistant: {assistant_text}",
+                })
+                pending_user = None
+        return turns

@@ -85,8 +85,36 @@ let activeToolPanel = null;
 let pendingToolCard = null;
 let reconnectAttempts = 0;
 let reconnectTimer = null;
+let reconnectCountdownId = null;
+let pendingMessages = [];
+let maxReconnectAttempts = 10;
 
 function setBusy(b) { busy = b; sendBtn.disabled = b; input.disabled = b; if (!b) input.focus(); }
+
+function clearTrace() { activeTrace = null; activeToolPanel = null; pendingToolCard = null; }
+
+function startCountdown(delay) {
+  if (reconnectCountdownId) clearInterval(reconnectCountdownId);
+  let remaining = Math.ceil(delay / 1000);
+  status.textContent = `● reconnecting in ${remaining}s...`;
+  reconnectCountdownId = setInterval(function () {
+    remaining -= 1;
+    if (remaining <= 0) {
+      clearInterval(reconnectCountdownId);
+      reconnectCountdownId = null;
+      status.textContent = '● connecting...';
+    } else {
+      status.textContent = `● reconnecting in ${remaining}s...`;
+    }
+  }, 1000);
+}
+
+function flushPending() {
+  while (pendingMessages.length > 0 && ws && ws.readyState === WebSocket.OPEN) {
+    const msg = pendingMessages.shift();
+    ws.send(JSON.stringify(msg));
+  }
+}
 
 function addMsg(type, text) {
   const d = document.createElement('div');
@@ -296,37 +324,55 @@ function handleMessage(e) {
 function connect() {
   if (ws && ws.readyState === WebSocket.OPEN) return;
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  if (reconnectCountdownId) { clearInterval(reconnectCountdownId); reconnectCountdownId = null; }
+  if (reconnectAttempts >= maxReconnectAttempts) {
+    status.textContent = '● Connection lost. Refresh to reconnect.';
+    setBusy(true);
+    return;
+  }
   ws = new WebSocket(wsUrl);
-  ws.onopen = () => {
-    status.innerHTML = '<span class="ok">\u25cf online</span>';
+  ws.onopen = function () {
+    status.innerHTML = '<span class="ok">● online</span>';
     reconnectAttempts = 0;
-    fetch('/health').then(r => r.json()).then(d => {
-      status.innerHTML = `<span class="ok">\u25cf online</span> \u00b7 ${d.tools} tools \u00b7 $${d.spent_today.toFixed(4)}/${d.daily_cap}`;
-    }).catch(() => {});
+    flushPending();
+    fetch('/health').then(function (r) { return r.json(); }).then(function (d) {
+      status.innerHTML = '<span class="ok">● online</span> · ' + d.tools + ' tools · $' + d.spent_today.toFixed(4) + '/' + d.daily_cap;
+    }).catch(function () {});
     setBusy(false);
   };
-  ws.onclose = () => {
-    status.innerHTML = '\u25cf disconnected';
-    setBusy(true);
-    const delay = Math.min(5000 * Math.pow(2, reconnectAttempts), 30000);
+  ws.onclose = function () {
+    clearTrace();
+    msgs.querySelectorAll('.msg.thinking').forEach(function (t) { t.remove(); });
+    setBusy(false);
+    if (reconnectAttempts >= maxReconnectAttempts) {
+      status.textContent = '● Connection lost. Refresh to reconnect.';
+      return;
+    }
+    var delay = Math.min(5000 * Math.pow(2, reconnectAttempts), 30000);
+    delay += Math.floor(Math.random() * 1000);
     reconnectAttempts += 1;
-    status.innerHTML = `\u25cf reconnecting in ${Math.round(delay / 1000)}s...`;
+    startCountdown(delay);
     reconnectTimer = setTimeout(connect, delay);
   };
-  ws.onerror = () => { status.innerHTML = '\u25cf error'; };
+  ws.onerror = function () { status.textContent = '● error'; };
   ws.onmessage = handleMessage;
 }
 
 function send() {
-  const text = input.value.trim();
-  if (!text || busy) return;
+  var text = input.value.trim();
+  if (!text) return;
   activeTrace = null;
   activeToolPanel = null;
   pendingToolCard = null;
   addMsg('user', text);
   input.value = '';
   setBusy(true);
-  ws.send(JSON.stringify({ text, session_id: 'default' }));
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    pendingMessages.push({ text: text, session_id: 'default' });
+    addMsg('error', 'Message queued — reconnecting...');
+    return;
+  }
+  ws.send(JSON.stringify({ text: text, session_id: 'default' }));
 }
 
 sendBtn.onclick = send;

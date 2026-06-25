@@ -71,7 +71,7 @@ class TestBuildBot:
     def test_all_handlers_registered(self):
         app = build_bot("123:abc")
         total = sum(len(g) for g in app.handlers.values())
-        assert total == 5
+        assert total == 4
 
     def test_start_handler_exists(self):
         app = build_bot("123:abc")
@@ -82,6 +82,6 @@ class TestBuildBot:
         }
         assert "start_cmd" in handler_names
         assert "help_cmd" in handler_names
-        assert "cost_cmd" in handler_names
         assert "reset_cmd" in handler_names
+
         assert "message_handler" in handler_names

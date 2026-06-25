@@ -9,6 +9,7 @@ from typing import Any
 
 from telegram import Update
 from telegram.constants import ParseMode
+from telegram.error import RetryAfter, TimedOut, NetworkError
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 from telegram.helpers import escape_markdown
 
@@ -110,23 +111,42 @@ def _split_message(text: str, limit: int = _MAX_TELEGRAM_LEN) -> list[str]:
 async def _send_long(update: Update, text: str) -> None:
     """Send possibly-long text, split into multiple messages."""
     parts = _split_message(text)
-    for part in parts:
-        try:
-            await update.effective_chat.send_message(
-                part, parse_mode=ParseMode.MARKDOWN_V2
-            )
-        except Exception:
-            await update.effective_chat.send_message(part)
+    for i, part in enumerate(parts):
+        await _send_with_retry(update, part, parse_mode=ParseMode.MARKDOWN_V2)
+        if i < len(parts) - 1:
+            await asyncio.sleep(0.05)
 
 
 async def _send_safe(update: Update, text: str) -> None:
     """Send a single message with MarkdownV2, falling back to plain text."""
     try:
-        await update.effective_chat.send_message(
-            text, parse_mode=ParseMode.MARKDOWN_V2
-        )
+        await _send_with_retry(update, text, parse_mode=ParseMode.MARKDOWN_V2)
     except Exception:
-        await update.effective_chat.send_message(text)
+        await _send_with_retry(update, text, parse_mode=None)
+
+
+async def _send_with_retry(
+    update: Update,
+    text: str,
+    parse_mode: str | None = None,
+    max_retries: int = 3,
+) -> None:
+    for attempt in range(max_retries):
+        try:
+            await update.effective_chat.send_message(text, parse_mode=parse_mode)
+            return
+        except RetryAfter as e:
+            wait = float(e.retry_after) + 0.5
+            logger.warning(
+                "Telegram 429 rate limit hit, retrying after %.1fs (attempt %d/%d)",
+                wait, attempt + 1, max_retries,
+            )
+            await asyncio.sleep(wait)
+        except (TimedOut, NetworkError):
+            if attempt == max_retries - 1:
+                raise
+            await asyncio.sleep(2 ** attempt)
+    raise RuntimeError("Max retries exceeded for Telegram send")
 
 
 # ── command handlers ──────────────────────────────────────────────
@@ -149,7 +169,7 @@ async def start_cmd(update: Update, _context: Any) -> None:
         f"*Available tools:* {tool_count}\n"
         f"*Model:* {graph._model_name if graph else '?'}\n\n"
         f"Just send me any request to get started\\.\n"
-        f"*Commands:* /help \\| /cost \\| /reset",
+        f"*Commands:* /help \\| /reset",
     )
 
 
@@ -165,30 +185,8 @@ async def help_cmd(update: Update, _context: Any) -> None:
         "*Commands*\n\n"
         "/start  \\- Welcome message\n"
         "/help   \\- This list\n"
-        "/cost   \\- Today's spending\n"
         "/reset  \\- Start a fresh conversation\n\n"
         "You can also just send me any message and I will help you\\.",
-    )
-
-
-async def cost_cmd(update: Update, _context: Any) -> None:
-    if not update.effective_chat:
-        return
-    authorized, tg_id = _check_access(update)
-    if not authorized:
-        await _send_safe(update, f"\U0001f512 *Access denied*\nYour Telegram user ID: `{tg_id or 'unknown'}`\nAdd it to TELEGRAM_ALLOWED_USERS in your \\.env file\\.")
-        return
-    graph = get_graph()
-    if not graph or not graph._chatdb:
-        await _send_safe(update, "Cost tracking is not available right now\\.")
-        return
-    spent = graph._chatdb.spent_today()
-    cap = graph._daily_cap
-    pct = (spent / cap * 100) if cap > 0 else 0
-    await _send_safe(
-        update,
-        f"*Today*: \\${spent:.4f} / \\${cap:.2f} \\({pct:.1f}%\\)\n"
-        f"*Model*: `{graph._model_name}`",
     )
 
 
@@ -296,7 +294,6 @@ async def message_handler(update: Update, _context: Any) -> None:
     await bus.publish({
         "type": "answer",
         "text": final_text,
-        "cost_spent": round(result.get("cost_spent", 0), 6),
         "session_id": session_id,
     })
 
@@ -311,7 +308,6 @@ def build_bot(token: str) -> Application:
 
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("cost", cost_cmd))
     app.add_handler(CommandHandler("reset", reset_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 

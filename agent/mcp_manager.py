@@ -38,6 +38,9 @@ class MCPManager:
         self._exit_stack: AsyncExitStack | None = None
         self._tools: dict[str, str] = {}  # tool_name -> server_name
         self._loaded = False
+        self._healthy: dict[str, bool] = {}
+        self._health_task: asyncio.Task | None = None
+        self._health_interval: float = 30.0
 
     def _load_config(self) -> dict[str, Any]:
         with open(self.config_path, "r", encoding="utf-8") as f:
@@ -92,6 +95,7 @@ class MCPManager:
                 )
                 await session.initialize()
                 self._sessions[name] = session
+                self._healthy[name] = True
 
                 tools_resp = await session.list_tools()
                 for t in tools_resp.tools:
@@ -104,7 +108,9 @@ class MCPManager:
                 )
             except Exception as e:
                 logger.error("Failed to start MCP server '%s': %s", name, e)
+                self._healthy[name] = False
 
+        self._start_health_monitor()
         self._loaded = True
 
     async def list_tools_async(self) -> list[MCPTool]:
@@ -129,16 +135,60 @@ class MCPManager:
         server_name = self._tools.get(tool_name)
         if not server_name:
             raise KeyError(f"Tool '{tool_name}' not registered with any MCP server")
+        if not self._healthy.get(server_name, False):
+            raise RuntimeError(
+                f"MCP server '{server_name}' is unhealthy. "
+                f"Tool '{tool_name}' is unavailable."
+            )
         session = self._sessions[server_name]
         result = await session.call_tool(tool_name, arguments=arguments or {})
         return result
 
+    # ── health monitor ────────────────────────────────────────────
+
+    def _start_health_monitor(self) -> None:
+        if self._health_task and not self._health_task.done():
+            return
+        self._health_task = asyncio.create_task(self._health_loop())
+
+    def _stop_health_monitor(self) -> None:
+        if self._health_task and not self._health_task.done():
+            self._health_task.cancel()
+
+    async def _health_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self._health_interval)
+            for name in list(self._sessions.keys()):
+                await self._ping_server(name)
+
+    async def _ping_server(self, name: str) -> None:
+        session = self._sessions.get(name)
+        if session is None:
+            self._healthy[name] = False
+            return
+        try:
+            await asyncio.wait_for(session.list_tools(), timeout=10.0)
+            if not self._healthy.get(name):
+                logger.info("MCP server '%s' recovered — marked healthy", name)
+            self._healthy[name] = True
+        except Exception as exc:
+            was_healthy = self._healthy.get(name, True)
+            self._healthy[name] = False
+            level = logging.WARNING if was_healthy else logging.DEBUG
+            logger.log(level, "MCP server '%s' health check failed: %s", name, exc)
+
+    @property
+    def healthy_servers(self) -> list[str]:
+        return [n for n, h in self._healthy.items() if h]
+
     async def stop(self) -> None:
         """Shut down all MCP server subprocesses."""
+        self._stop_health_monitor()
         if self._exit_stack:
             await self._exit_stack.aclose()
         self._sessions.clear()
         self._tools.clear()
+        self._healthy.clear()
         self._loaded = False
         logger.info("MCP manager stopped")
 
@@ -148,4 +198,7 @@ class MCPManager:
 
     @property
     def tool_names(self) -> list[str]:
-        return list(self._tools.keys())
+        return [
+            t for t, s in self._tools.items()
+            if self._healthy.get(s, False)
+        ]

@@ -41,8 +41,6 @@ async def health():
     return JSONResponse({
         "status": "ok",
         "tools": len(graph.mcp.tool_names) if graph and graph.mcp else 0,
-        "spent_today": graph._chatdb.spent_today() if graph and graph._chatdb else 0.0,
-        "daily_cap": graph._daily_cap if graph else 0.0,
     })
 
 
@@ -163,9 +161,6 @@ async def chat_ws(ws: WebSocket):
                     await ws.send_json({
                         "type": "answer",
                         "text": result["text"],
-                        "cost_spent": round(result["cost_spent"], 6),
-                        "spent_today": round(graph._chatdb.spent_today(), 6) if graph and graph._chatdb else 0.0,
-                        "daily_cap": graph._daily_cap if graph else 0.0,
                     })
             except asyncio.TimeoutError:
                 async with ws_lock:
