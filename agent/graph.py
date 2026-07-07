@@ -137,6 +137,8 @@ class AgentGraph:
                 openai_api_base=ocfg.get("base_url", "https://api.deepseek.com"),
                 temperature=temperature,
                 model_kwargs=model_kwargs if model_kwargs else None,
+                timeout=60,
+                max_retries=1,
             )
         elif self._llm_backend == "nvidia":
             from langchain_nvidia_ai_endpoints import ChatNVIDIA
@@ -158,6 +160,8 @@ class AgentGraph:
                 openai_api_key=ocfg.get("api_key", ""),
                 openai_api_base=ocfg.get("base_url", "https://openrouter.ai/api/v1"),
                 temperature=temperature,
+                timeout=60,
+                max_retries=1,
             )
 
         groq_cfg = llm_cfg.get("groq", {})
@@ -169,6 +173,8 @@ class AgentGraph:
                 openai_api_key=groq_key,
                 openai_api_base=groq_cfg.get("base_url", "https://api.groq.com/openai/v1"),
                 temperature=0.0,
+                timeout=60,
+                max_retries=1,
             )
             logger.info("Groq vision LLM ready: %s", self._groq_model)
 

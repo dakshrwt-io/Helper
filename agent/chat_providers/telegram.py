@@ -249,7 +249,10 @@ async def message_handler(update: Update, _context: Any) -> None:
             async with get_chat_lock():
                 return await graph.chat(user_text, session_id=session_id, trace_queue=trace_queue)
 
-        await update.effective_chat.send_chat_action("typing")
+        try:
+            await update.effective_chat.send_chat_action("typing")
+        except Exception:
+            pass
         result = await asyncio.wait_for(_locked_chat(), timeout=180)
     except asyncio.TimeoutError:
         bridge_task.cancel()
