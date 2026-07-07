@@ -18,6 +18,7 @@ class VectorStore:
         self._collection_name = collection
         self._client: chromadb.PersistentClient | None = None
         self._col: Any = None
+        self._has_documents = False
         self._init_store()
 
     def _init_store(self) -> None:
@@ -27,6 +28,7 @@ class VectorStore:
                 name=self._collection_name,
                 metadata={"hnsw:space": "cosine"},
             )
+            self._has_documents = self.count() > 0
         except Exception as exc:
             logger.warning(
                 "ChromaDB init failed, attempting recovery: %s", exc
@@ -43,6 +45,7 @@ class VectorStore:
                 name=self._collection_name,
                 metadata={"hnsw:space": "cosine"},
             )
+            self._has_documents = False
             logger.info("ChromaDB recovered — store recreated from scratch")
         except Exception as exc:
             logger.error("ChromaDB recovery failed: %s", exc)
@@ -50,13 +53,11 @@ class VectorStore:
 
     def add(self, ids: list[str], texts: list[str], metas: list[dict[str, Any]] | None = None) -> None:
         self._col.add(ids=ids, documents=texts, metadatas=metas or [{} for _ in ids])
+        if ids:
+            self._has_documents = True
 
     def query(self, text: str, top_k: int = 5) -> list[dict[str, Any]]:
-        try:
-            count = self._col.count()
-        except Exception:
-            count = 0
-        if count == 0:
+        if not self._has_documents:
             return []
         res = self._col.query(query_texts=[text], n_results=top_k)
         out: list[dict[str, Any]] = []
@@ -73,7 +74,13 @@ class VectorStore:
         except Exception:
             return 0
 
-    def rebuild(self, ids: list[str], texts: list[str], metas: list[dict[str, Any]] | None = None) -> int:
+    def rebuild(
+        self,
+        ids: list[str],
+        texts: list[str],
+        metas: list[dict[str, Any]] | None = None,
+        batch_size: int = 500,
+    ) -> int:
         try:
             self._client.delete_collection(self._collection_name)
         except Exception:
@@ -82,8 +89,18 @@ class VectorStore:
             name=self._collection_name,
             metadata={"hnsw:space": "cosine"},
         )
+        self._has_documents = False
         if ids:
-            self.add(ids=ids, texts=texts, metas=metas)
+            metadata = metas or [{} for _ in ids]
+            step = max(1, batch_size)
+            for start in range(0, len(ids), step):
+                end = start + step
+                self.add(
+                    ids=ids[start:end],
+                    texts=texts[start:end],
+                    metas=metadata[start:end],
+                )
         added = self.count()
+        self._has_documents = added > 0
         logger.info("Vector store rebuilt with %d documents", added)
         return added

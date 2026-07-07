@@ -49,6 +49,23 @@ class ChatDB:
         finally:
             s.close()
 
+    def add_turn(self, session_id: str, user_text: str, assistant_text: str) -> None:
+        s = self.Session()
+        try:
+            s.add_all(
+                [
+                    MessageRow(session_id=session_id, role="user", content=user_text),
+                    MessageRow(
+                        session_id=session_id,
+                        role="assistant",
+                        content=assistant_text,
+                    ),
+                ]
+            )
+            s.commit()
+        finally:
+            s.close()
+
     def get_history(self, session_id: str, limit: int = 50) -> list[dict]:
         s = self.Session()
         try:

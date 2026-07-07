@@ -95,5 +95,7 @@ def _make_tool(mcp_tool: MCPTool, mgr: MCPManager) -> StructuredTool:
 
 async def build_langchain_tools(mgr: MCPManager) -> list[StructuredTool]:
     """Fetch all MCP tools and wrap as LangChain StructuredTools."""
-    mcp_tools = await mgr.list_tools_async()
+    mcp_tools = list(getattr(mgr, "tool_definitions", []))
+    if not mcp_tools:
+        mcp_tools = await mgr.list_tools_async()
     return [_make_tool(t, mgr) for t in mcp_tools]

@@ -180,12 +180,27 @@ class AgentGraph:
 
     async def setup(self) -> None:
         """Async init: load config, start MCP, build LLM+tools+graph."""
+        setup_start = time.perf_counter()
+        phase_start = time.perf_counter()
         self._load()
+        logger.info("Agent setup load completed in %d ms", duration_ms(phase_start))
+
+        phase_start = time.perf_counter()
         await self.mcp.start()
+        logger.info("Agent setup MCP start completed in %d ms", duration_ms(phase_start))
+
+        phase_start = time.perf_counter()
         self._make_llm()
+        logger.info("Agent setup LLM init completed in %d ms", duration_ms(phase_start))
 
+        phase_start = time.perf_counter()
         tools = await build_langchain_tools(self.mcp)
+        logger.info(
+            "Agent setup tool wrapping completed in %d ms",
+            duration_ms(phase_start),
+        )
 
+        phase_start = time.perf_counter()
         cc = self._cfg.get("computer_control", {})
         if str(cc.get("enabled", "")).lower() == "true":
             set_confirm_config(
@@ -193,7 +208,12 @@ class AgentGraph:
                 timeout=float(cc.get("confirm_timeout", 60)),
             )
             tools.extend(get_computer_tools())
+        logger.info(
+            "Agent setup computer tools completed in %d ms",
+            duration_ms(phase_start),
+        )
 
+        phase_start = time.perf_counter()
         if self._cfg.get("subagents", {}).get("enabled", True):
             self._subagent_manager = SubAgentManager(
                 raw_config=self._cfg,
@@ -205,10 +225,20 @@ class AgentGraph:
             )
             if self._subagent_manager.agent_names:
                 tools.append(build_task_tool(self._subagent_manager, self._chatdb))
+        logger.info(
+            "Agent setup subagents completed in %d ms",
+            duration_ms(phase_start),
+        )
 
+        phase_start = time.perf_counter()
         self._llm_with_tools = self._llm.bind_tools(tools) if tools else self._llm
         self._tools_node = ToolNode(tools) if tools else None
         self._build_graph()
+        logger.info(
+            "Agent setup graph compile completed in %d ms",
+            duration_ms(phase_start),
+        )
+        logger.info("Agent setup completed in %d ms", duration_ms(setup_start))
 
     def _build_graph(self) -> None:
         max_iter = int(self._cfg.get("agent", {}).get("max_iterations", 15))
@@ -329,13 +359,13 @@ class AgentGraph:
         g.add_edge("tools", "agent")
         self._graph = g.compile()
 
-    def _recall_context(self, user_text: str, trace: TraceCollector) -> list[str]:
+    async def _recall_context(self, user_text: str, trace: TraceCollector) -> list[str]:
         if not self._vector:
             return []
 
         recall_start = time.perf_counter()
         trace.emit("memory_recall_started")
-        hits = self._vector.query(user_text, top_k=3)
+        hits = await asyncio.to_thread(self._vector.query, user_text, 3)
         recalled = [h["text"] for h in hits if h.get("distance", 1.0) < 0.6]
         trace.emit(
             "memory_recall_completed",
@@ -344,13 +374,14 @@ class AgentGraph:
         )
         return recalled
 
-    def _load_history_messages(self, session_id: str, trace: TraceCollector) -> list[Any]:
+    async def _load_history_messages(self, session_id: str, trace: TraceCollector) -> list[Any]:
         if not self._chatdb:
             return []
 
         history_start = time.perf_counter()
         prior: list[Any] = []
-        for m in self._chatdb.get_history(session_id, limit=20):
+        history = await asyncio.to_thread(self._chatdb.get_history, session_id, 20)
+        for m in history:
             if m["role"] == "user":
                 prior.append(HumanMessage(content=m["content"]))
             else:
@@ -398,7 +429,7 @@ class AgentGraph:
             "Please try a simpler request or rephrase."
         )
 
-    def _persist_turn(
+    async def _persist_turn(
         self,
         session_id: str,
         user_text: str,
@@ -407,13 +438,28 @@ class AgentGraph:
     ) -> None:
         persist_start = time.perf_counter()
         if self._chatdb:
-            self._chatdb.add_message(session_id, "user", user_text)
-            self._chatdb.add_message(session_id, "assistant", final)
+            add_turn = getattr(self._chatdb, "add_turn", None)
+            if callable(add_turn):
+                await asyncio.to_thread(add_turn, session_id, user_text, final)
+            else:
+                await asyncio.to_thread(
+                    self._chatdb.add_message,
+                    session_id,
+                    "user",
+                    user_text,
+                )
+                await asyncio.to_thread(
+                    self._chatdb.add_message,
+                    session_id,
+                    "assistant",
+                    final,
+                )
         if self._vector and final:
-            self._vector.add(
-                ids=[str(uuid.uuid4())],
-                texts=[f"User: {user_text}\nAssistant: {final}"],
-                metas=[{"session_id": session_id}],
+            await asyncio.to_thread(
+                self._vector.add,
+                [str(uuid.uuid4())],
+                [f"User: {user_text}\nAssistant: {final}"],
+                [{"session_id": session_id}],
             )
         trace.emit("memory_persisted", duration_ms=duration_ms(persist_start))
 
@@ -431,8 +477,8 @@ class AgentGraph:
             trace.emit("turn_started", session_id=session_id)
             clear_screenshots()
             try:
-                recalled = self._recall_context(user_text, trace)
-                prior = self._load_history_messages(session_id, trace)
+                recalled = await self._recall_context(user_text, trace)
+                prior = await self._load_history_messages(session_id, trace)
                 msgs = self._build_turn_messages(user_text, recalled, prior)
                 state: AgentState = {
                     "messages": msgs,
@@ -446,7 +492,7 @@ class AgentGraph:
                 out_msgs = result.get("messages", [])
                 final = self._extract_final_text(out_msgs)
 
-                self._persist_turn(session_id, user_text, final, trace)
+                await self._persist_turn(session_id, user_text, final, trace)
                 trace.emit(
                     "turn_completed",
                     duration_ms=duration_ms(turn_start),

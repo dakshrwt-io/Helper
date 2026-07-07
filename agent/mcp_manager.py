@@ -37,6 +37,7 @@ class MCPManager:
         self._sessions: dict[str, ClientSession] = {}
         self._exit_stack: AsyncExitStack | None = None
         self._tools: dict[str, str] = {}  # tool_name -> server_name
+        self._tool_defs: dict[str, MCPTool] = {}
         self._loaded = False
         self._healthy: dict[str, bool] = {}
         self._health_task: asyncio.Task | None = None
@@ -100,6 +101,7 @@ class MCPManager:
                 tools_resp = await session.list_tools()
                 for t in tools_resp.tools:
                     self._tools[t.name] = name
+                    self._tool_defs[t.name] = t
                 logger.info(
                     "MCP server '%s' started, %d tools: %s",
                     name,
@@ -122,6 +124,7 @@ class MCPManager:
                 out.extend(resp.tools)
                 for t in resp.tools:
                     self._tools[t.name] = name
+                    self._tool_defs[t.name] = t
             except Exception as e:
                 logger.error("list_tools failed for '%s': %s", name, e)
         return out
@@ -188,6 +191,7 @@ class MCPManager:
             await self._exit_stack.aclose()
         self._sessions.clear()
         self._tools.clear()
+        self._tool_defs.clear()
         self._healthy.clear()
         self._loaded = False
         logger.info("MCP manager stopped")
@@ -201,4 +205,11 @@ class MCPManager:
         return [
             t for t, s in self._tools.items()
             if self._healthy.get(s, False)
+        ]
+
+    @property
+    def tool_definitions(self) -> list[MCPTool]:
+        return [
+            tool for name, tool in self._tool_defs.items()
+            if self._healthy.get(self._tools.get(name, ""), False)
         ]
