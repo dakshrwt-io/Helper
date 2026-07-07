@@ -129,6 +129,24 @@ function scrollToBottom() {
   msgs.scrollTop = msgs.scrollHeight;
 }
 
+function formatMoney(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n.toFixed(4) : null;
+}
+
+function updateStatus(data) {
+  const parts = ['<span class="ok">online</span>'];
+  if (data && Number.isFinite(Number(data.tools))) {
+    parts.push(`${Number(data.tools)} tools`);
+  }
+  const spent = formatMoney(data && data.spent_today);
+  const cap = data && Number.isFinite(Number(data.daily_cap)) ? Number(data.daily_cap) : null;
+  if (spent !== null && cap !== null) {
+    parts.push(`$${spent}/${cap}`);
+  }
+  status.innerHTML = parts.join(' | ');
+}
+
 function ensureTracePanel() {
   if (activeTrace) return activeTrace;
   const panel = document.createElement('section');
@@ -312,7 +330,7 @@ function handleMessage(e) {
   } else if (data.type === 'answer') {
     msgs.querySelectorAll('.msg.thinking').forEach(t => t.remove());
     addMsg('assistant', data.text);
-    status.innerHTML = `<span class="ok">\u25cf online</span> \u00b7 $${data.spent_today.toFixed(4)}/${data.daily_cap}`;
+    updateStatus(data);
     setBusy(false);
   } else if (data.type === 'error') {
     msgs.querySelectorAll('.msg.thinking').forEach(t => t.remove());
@@ -332,11 +350,11 @@ function connect() {
   }
   ws = new WebSocket(wsUrl);
   ws.onopen = function () {
-    status.innerHTML = '<span class="ok">● online</span>';
+    updateStatus({});
     reconnectAttempts = 0;
     flushPending();
     fetch('/health').then(function (r) { return r.json(); }).then(function (d) {
-      status.innerHTML = '<span class="ok">● online</span> · ' + d.tools + ' tools · $' + d.spent_today.toFixed(4) + '/' + d.daily_cap;
+      updateStatus(d);
     }).catch(function () {});
     setBusy(false);
   };

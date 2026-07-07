@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 import time
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 
@@ -94,7 +95,6 @@ class AgentGraph:
                     "Vector store is empty — rebuilding from %d SQLite turns",
                     len(turns),
                 )
-                import uuid
                 self._vector.rebuild(
                     ids=[str(uuid.uuid4()) for _ in turns],
                     texts=[t["text"] for t in turns],
@@ -329,6 +329,94 @@ class AgentGraph:
         g.add_edge("tools", "agent")
         self._graph = g.compile()
 
+    def _recall_context(self, user_text: str, trace: TraceCollector) -> list[str]:
+        if not self._vector:
+            return []
+
+        recall_start = time.perf_counter()
+        trace.emit("memory_recall_started")
+        hits = self._vector.query(user_text, top_k=3)
+        recalled = [h["text"] for h in hits if h.get("distance", 1.0) < 0.6]
+        trace.emit(
+            "memory_recall_completed",
+            duration_ms=duration_ms(recall_start),
+            matches=len(recalled),
+        )
+        return recalled
+
+    def _load_history_messages(self, session_id: str, trace: TraceCollector) -> list[Any]:
+        if not self._chatdb:
+            return []
+
+        history_start = time.perf_counter()
+        prior: list[Any] = []
+        for m in self._chatdb.get_history(session_id, limit=20):
+            if m["role"] == "user":
+                prior.append(HumanMessage(content=m["content"]))
+            else:
+                prior.append(AIMessage(content=m["content"]))
+        trace.emit(
+            "memory_history_loaded",
+            duration_ms=duration_ms(history_start),
+            messages=len(prior),
+        )
+        return prior
+
+    def _build_turn_messages(
+        self,
+        user_text: str,
+        recalled: list[str],
+        prior: list[Any],
+    ) -> list[Any]:
+        msgs: list[Any] = []
+        if recalled:
+            msgs.append(
+                SystemMessage(
+                    content="\n\nRelevant past context:\n" + "\n---\n".join(recalled)
+                )
+            )
+        msgs.extend(prior)
+        msgs.append(HumanMessage(content=user_text))
+        return msgs
+
+    @staticmethod
+    def _extract_final_text(out_msgs: list[Any]) -> str:
+        final = ""
+        for m in reversed(out_msgs):
+            if isinstance(m, AIMessage) and not getattr(m, "tool_calls", None):
+                final = display_content(m.content)
+                break
+        if not final:
+            for m in reversed(out_msgs):
+                if isinstance(m, AIMessage):
+                    final = display_content(m.content) if m.content else ""
+                    break
+        if final:
+            return final
+        return (
+            "I wasn't able to complete this task within the iteration limit. "
+            "Please try a simpler request or rephrase."
+        )
+
+    def _persist_turn(
+        self,
+        session_id: str,
+        user_text: str,
+        final: str,
+        trace: TraceCollector,
+    ) -> None:
+        persist_start = time.perf_counter()
+        if self._chatdb:
+            self._chatdb.add_message(session_id, "user", user_text)
+            self._chatdb.add_message(session_id, "assistant", final)
+        if self._vector and final:
+            self._vector.add(
+                ids=[str(uuid.uuid4())],
+                texts=[f"User: {user_text}\nAssistant: {final}"],
+                metas=[{"session_id": session_id}],
+            )
+        trace.emit("memory_persisted", duration_ms=duration_ms(persist_start))
+
     async def chat(
         self,
         user_text: str,
@@ -343,44 +431,9 @@ class AgentGraph:
             trace.emit("turn_started", session_id=session_id)
             clear_screenshots()
             try:
-                # 1. recall: fetch relevant past turns
-                recalled: list[str] = []
-                if self._vector:
-                    recall_start = time.perf_counter()
-                    trace.emit("memory_recall_started")
-                    hits = self._vector.query(user_text, top_k=3)
-                    recalled = [h["text"] for h in hits if h.get("distance", 1.0) < 0.6]
-                    trace.emit(
-                        "memory_recall_completed",
-                        duration_ms=duration_ms(recall_start),
-                        matches=len(recalled),
-                    )
-
-                # 2. load SQLite history for this session
-                prior: list[Any] = []
-                if self._chatdb:
-                    history_start = time.perf_counter()
-                    for m in self._chatdb.get_history(session_id, limit=20):
-                        if m["role"] == "user":
-                            prior.append(HumanMessage(content=m["content"]))
-                        else:
-                            prior.append(AIMessage(content=m["content"]))
-                    trace.emit(
-                        "memory_history_loaded",
-                        duration_ms=duration_ms(history_start),
-                        messages=len(prior),
-                    )
-
-                # 3. assemble: persona + recalled context + history + new msg
-                context_msg = ""
-                if recalled:
-                    context_msg = "\n\nRelevant past context:\n" + "\n---\n".join(recalled)
-                msgs: list[Any] = []
-                if context_msg:
-                    msgs.append(SystemMessage(content=context_msg))
-                msgs.extend(prior)
-                msgs.append(HumanMessage(content=user_text))
-
+                recalled = self._recall_context(user_text, trace)
+                prior = self._load_history_messages(session_id, trace)
+                msgs = self._build_turn_messages(user_text, recalled, prior)
                 state: AgentState = {
                     "messages": msgs,
                     "session_id": session_id,
@@ -391,33 +444,9 @@ class AgentGraph:
                 }
                 result = await self._graph.ainvoke(state)
                 out_msgs = result.get("messages", [])
-                final = ""
-                for m in reversed(out_msgs):
-                    if isinstance(m, AIMessage) and not getattr(m, "tool_calls", None):
-                        final = display_content(m.content)
-                        break
-                if not final:
-                    for m in reversed(out_msgs):
-                        if isinstance(m, AIMessage):
-                            final = display_content(m.content) if m.content else ""
-                            break
-                if not final:
-                    final = "I wasn't able to complete this task within the iteration limit. Please try a simpler request or rephrase."
+                final = self._extract_final_text(out_msgs)
 
-                # 4. persist to SQLite + ChromaDB
-                persist_start = time.perf_counter()
-                if self._chatdb:
-                    self._chatdb.add_message(session_id, "user", user_text)
-                    self._chatdb.add_message(session_id, "assistant", final)
-                if self._vector and final:
-                    import uuid
-                    uid = str(uuid.uuid4())
-                    self._vector.add(
-                        ids=[uid],
-                        texts=[f"User: {user_text}\nAssistant: {final}"],
-                        metas=[{"session_id": session_id}],
-                    )
-                trace.emit("memory_persisted", duration_ms=duration_ms(persist_start))
+                self._persist_turn(session_id, user_text, final, trace)
                 trace.emit(
                     "turn_completed",
                     duration_ms=duration_ms(turn_start),
@@ -426,6 +455,7 @@ class AgentGraph:
                 )
                 return {
                     "text": final,
+                    "cost_spent": 0.0,
                     "messages": out_msgs,
                     "trace": trace.events,
                 }

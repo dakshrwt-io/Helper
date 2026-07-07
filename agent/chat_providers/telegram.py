@@ -109,10 +109,14 @@ def _split_message(text: str, limit: int = _MAX_TELEGRAM_LEN) -> list[str]:
 
 
 async def _send_long(update: Update, text: str) -> None:
-    """Send possibly-long text, split into multiple messages."""
+    """Send arbitrary assistant text, split into Telegram-sized messages.
+
+    Model output is not guaranteed to be valid Telegram MarkdownV2. Sending it
+    as plain text avoids parse errors that would otherwise drop the final reply.
+    """
     parts = _split_message(text)
     for i, part in enumerate(parts):
-        await _send_with_retry(update, part, parse_mode=ParseMode.MARKDOWN_V2)
+        await _send_with_retry(update, part, parse_mode=None)
         if i < len(parts) - 1:
             await asyncio.sleep(0.05)
 

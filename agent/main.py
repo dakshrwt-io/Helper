@@ -30,6 +30,51 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
+def _daily_cap() -> float:
+    raw = os.environ.get("DAILY_COST_USD", "1.0")
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        logger.warning("Invalid DAILY_COST_USD=%r; using 1.0", raw)
+        return 1.0
+
+
+def _tool_count(graph) -> int:
+    return len(graph.mcp.tool_names) if graph and graph.mcp else 0
+
+
+def _spent_today(graph) -> float:
+    chatdb = getattr(graph, "_chatdb", None)
+    if chatdb is None:
+        return 0.0
+    try:
+        return float(chatdb.spent_today())
+    except Exception:
+        logger.exception("Failed to read daily spend")
+        return 0.0
+
+
+def _status_payload(graph=None) -> dict:
+    graph = get_graph() if graph is None else graph
+    return {
+        "status": "ok",
+        "tools": _tool_count(graph),
+        "spent_today": _spent_today(graph),
+        "daily_cap": _daily_cap(),
+    }
+
+
+def _answer_payload(result: dict, graph=None) -> dict:
+    status = _status_payload(graph)
+    return {
+        "type": "answer",
+        "text": result["text"],
+        "cost_spent": float(result.get("cost_spent", 0.0)),
+        "spent_today": status["spent_today"],
+        "daily_cap": status["daily_cap"],
+    }
+
+
 @app.get("/")
 async def index():
     return FileResponse(os.path.join(os.path.dirname(__file__), "web", "index.html"))
@@ -37,11 +82,7 @@ async def index():
 
 @app.get("/health")
 async def health():
-    graph = get_graph()
-    return JSONResponse({
-        "status": "ok",
-        "tools": len(graph.mcp.tool_names) if graph and graph.mcp else 0,
-    })
+    return JSONResponse(_status_payload())
 
 
 async def _run_chat_with_trace(ws: WebSocket, user_text: str, session_id: str) -> dict:
@@ -158,10 +199,7 @@ async def chat_ws(ws: WebSocket):
             try:
                 result = await _run_chat_with_trace(ws, user_text, session_id)
                 async with ws_lock:
-                    await ws.send_json({
-                        "type": "answer",
-                        "text": result["text"],
-                    })
+                    await ws.send_json(_answer_payload(result, graph))
             except asyncio.TimeoutError:
                 async with ws_lock:
                     await ws.send_json({"type": "error", "text": "Agent timed out (180s)"})

@@ -1,10 +1,13 @@
 """Unit tests for Telegram bot construction and utilities."""
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from agent.chat_providers.telegram import (
     _parse_allowed_users,
+    _send_long,
     _split_message,
     build_bot,
 )
@@ -57,6 +60,27 @@ class TestSplitMessage:
         parts = _split_message(text, limit=5)
         for p in parts:
             assert len(p) > 0
+
+
+class TestSendLong:
+    def test_sends_assistant_output_as_plain_text(self):
+        class FakeChat:
+            def __init__(self):
+                self.sent = []
+
+            async def send_message(self, text, parse_mode=None):
+                self.sent.append({"text": text, "parse_mode": parse_mode})
+
+        class FakeUpdate:
+            effective_chat = FakeChat()
+
+        text = "Here is *markdown*, underscores_like_this, and [a link](x)."
+
+        asyncio.run(_send_long(FakeUpdate(), text))
+
+        assert FakeUpdate.effective_chat.sent == [
+            {"text": text, "parse_mode": None}
+        ]
 
 
 class TestBuildBot:
