@@ -18,8 +18,6 @@ def main() -> None:
     for m in h:
         print(f"  [{m['role']}] {m['content'][:80]}")
 
-    print(f"\nspent today: ${d.spent_today()}")
-
     print("\n=== ChromaDB recall ===")
     print(f"vector store count: {v.count()}")
     hits = v.query("list files directory", top_k=2)

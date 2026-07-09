@@ -6,6 +6,7 @@ import asyncio
 import pytest
 
 from agent.chat_providers.telegram import (
+    _check_access,
     _parse_allowed_users,
     _send_long,
     _split_message,
@@ -30,6 +31,17 @@ class TestParseAllowedUsers:
 
     def test_trims_whitespace(self):
         assert _parse_allowed_users(" 123 , 456 ") == {123, 456}
+
+    def test_empty_allowlist_denies_access(self, monkeypatch):
+        monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "")
+
+        class User:
+            id = 123
+
+        class FakeUpdate:
+            effective_user = User()
+
+        assert _check_access(FakeUpdate()) == (False, 123)
 
 
 class TestSplitMessage:
@@ -95,7 +107,7 @@ class TestBuildBot:
     def test_all_handlers_registered(self):
         app = build_bot("123:abc")
         total = sum(len(g) for g in app.handlers.values())
-        assert total == 4
+        assert total == 6
 
     def test_start_handler_exists(self):
         app = build_bot("123:abc")
@@ -107,5 +119,7 @@ class TestBuildBot:
         assert "start_cmd" in handler_names
         assert "help_cmd" in handler_names
         assert "reset_cmd" in handler_names
+        assert "desktop_on_cmd" in handler_names
+        assert "desktop_off_cmd" in handler_names
 
         assert "message_handler" in handler_names

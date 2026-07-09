@@ -14,6 +14,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters
 from telegram.helpers import escape_markdown
 
 from agent.shared import get_graph, get_chat_lock, get_chat_bus
+from agent.tools.computer import grant_desktop_lease, revoke_desktop_lease
 
 logger = logging.getLogger("agent.telegram")
 _MAX_TELEGRAM_LEN = 4000
@@ -35,9 +36,8 @@ def _check_access(update: Update) -> tuple[bool, int | None]:
     allowed = _parse_allowed_users(os.environ.get("TELEGRAM_ALLOWED_USERS", ""))
     user_id = update.effective_user.id if update.effective_user else None
     if not allowed:
-        if not user_id:
-            logger.warning("TELEGRAM_ALLOWED_USERS is empty — all users accepted")
-        return True, user_id
+        logger.warning("TELEGRAM_ALLOWED_USERS is empty — access denied")
+        return False, user_id
     if user_id is None:
         return False, None
     if user_id not in allowed:
@@ -201,8 +201,29 @@ async def reset_cmd(update: Update, _context: Any) -> None:
     if not authorized:
         await _send_safe(update, f"\U0001f512 *Access denied*\nYour Telegram user ID: `{tg_id or 'unknown'}`\nAdd it to TELEGRAM_ALLOWED_USERS in your \\.env file\\.")
         return
-    _context.user_data.pop("session_id", None)
+    old_session = _context.user_data.pop("session_id", None)
+    if old_session:
+        revoke_desktop_lease(old_session)
     await _send_safe(update, "Conversation reset\\. The agent will not remember previous messages from this chat\\.")
+
+
+async def desktop_on_cmd(update: Update, _context: Any) -> None:
+    authorized, _ = _check_access(update)
+    if not authorized or not update.effective_chat:
+        return
+    session_id = _context.user_data.get("session_id") or f"telegram_{update.effective_chat.id}"
+    _context.user_data["session_id"] = session_id
+    seconds = grant_desktop_lease(session_id)
+    await _send_safe(update, f"Desktop control enabled for {seconds} seconds\\.")
+
+
+async def desktop_off_cmd(update: Update, _context: Any) -> None:
+    authorized, _ = _check_access(update)
+    if not authorized or not update.effective_chat:
+        return
+    session_id = _context.user_data.get("session_id") or f"telegram_{update.effective_chat.id}"
+    revoke_desktop_lease(session_id)
+    await _send_safe(update, "Desktop control disabled\\.")
 
 
 # ── message handler ───────────────────────────────────────────────
@@ -239,18 +260,18 @@ async def message_handler(update: Update, _context: Any) -> None:
         try:
             while True:
                 event = await trace_queue.get()
-                await bus.publish({"type": "trace", "event": event})
+                await bus.publish(session_id, {"type": "trace", "event": event})
         except asyncio.CancelledError:
             raise
 
     bridge_task = asyncio.create_task(_bridge())
 
     try:
-        await bus.publish({"type": "remote_user", "text": user_text, "session_id": session_id, "source": "telegram"})
-        await bus.publish({"type": "thinking"})
+        await bus.publish(session_id, {"type": "remote_user", "text": user_text, "source": "telegram"})
+        await bus.publish(session_id, {"type": "thinking"})
 
         async def _locked_chat() -> dict:
-            async with get_chat_lock():
+            async with get_chat_lock(session_id):
                 return await graph.chat(user_text, session_id=session_id, trace_queue=trace_queue)
 
         try:
@@ -266,7 +287,7 @@ async def message_handler(update: Update, _context: Any) -> None:
             pass
         while not trace_queue.empty():
             try:
-                await bus.publish({"type": "trace", "event": trace_queue.get_nowait()})
+                await bus.publish(session_id, {"type": "trace", "event": trace_queue.get_nowait()})
             except asyncio.QueueEmpty:
                 break
         await _send_safe(update, "The agent timed out \\(180s\\)\\. Please try a simpler request\\.")
@@ -289,7 +310,7 @@ async def message_handler(update: Update, _context: Any) -> None:
 
     while not trace_queue.empty():
         try:
-            await bus.publish({"type": "trace", "event": trace_queue.get_nowait()})
+            await bus.publish(session_id, {"type": "trace", "event": trace_queue.get_nowait()})
         except asyncio.QueueEmpty:
             break
 
@@ -298,10 +319,9 @@ async def message_handler(update: Update, _context: Any) -> None:
         await _send_safe(update, "I did not produce a final answer\\. Please try rephrasing your request\\.")
         return
 
-    await bus.publish({
+    await bus.publish(session_id, {
         "type": "answer",
         "text": final_text,
-        "session_id": session_id,
     })
 
     await _send_long(update, final_text)
@@ -316,6 +336,8 @@ def build_bot(token: str) -> Application:
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("reset", reset_cmd))
+    app.add_handler(CommandHandler("desktop_on", desktop_on_cmd))
+    app.add_handler(CommandHandler("desktop_off", desktop_off_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
     logger.info("Telegram bot handlers registered")

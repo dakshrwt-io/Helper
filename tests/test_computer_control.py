@@ -1,36 +1,24 @@
-"""Unit tests for computer-control tools and confirmation system."""
+"""Unit tests for computer-control tools."""
 from __future__ import annotations
 
-import asyncio
-
-import pytest
 from langchain_core.messages import ToolMessage
 
 
 # ── helpers ──────────────────────────────────────────────────────────
 
 
-def _reset_confirmation_state() -> None:
+def _reset_state() -> None:
     """Reset module-level state between tests."""
-    from agent.tools.computer import (
-        _confirm_enabled,
-        _pending,
-        _results,
-        _screenshots,
-        set_confirm_config,
-    )
+    from agent.tools.computer import _screenshots
 
-    _pending.clear()
-    _results.clear()
     _screenshots.clear()
-    set_confirm_config(enabled=True, timeout=1.0)
 
 
 # ── tool creation ────────────────────────────────────────────────────
 
 
 def test_all_tools_created() -> None:
-    _reset_confirmation_state()
+    _reset_state()
     from agent.tools.computer import get_computer_tools
 
     tools = get_computer_tools()
@@ -52,7 +40,7 @@ def test_all_tools_created() -> None:
 
 
 def test_all_tools_are_structured() -> None:
-    _reset_confirmation_state()
+    _reset_state()
     from langchain_core.tools import StructuredTool
 
     from agent.tools.computer import get_computer_tools
@@ -67,7 +55,7 @@ def test_all_tools_are_structured() -> None:
 
 
 def test_inject_screenshots_replaces_tool_message() -> None:
-    _reset_confirmation_state()
+    _reset_state()
     from agent.tools.computer import _push_screenshot, inject_screenshots
 
     b64 = "iVBORw0KGgo="
@@ -92,7 +80,7 @@ def test_inject_screenshots_replaces_tool_message() -> None:
 
 
 def test_inject_screenshots_no_image_keeps_original() -> None:
-    _reset_confirmation_state()
+    _reset_state()
     from agent.tools.computer import inject_screenshots
 
     original = ToolMessage(
@@ -105,7 +93,7 @@ def test_inject_screenshots_no_image_keeps_original() -> None:
 
 
 def test_inject_screenshots_skips_non_screenshot_messages() -> None:
-    _reset_confirmation_state()
+    _reset_state()
     from agent.tools.computer import _push_screenshot, inject_screenshots
 
     _push_screenshot("b64")
@@ -118,121 +106,3 @@ def test_inject_screenshots_skips_non_screenshot_messages() -> None:
     assert result[0].content == "done"
     assert result[1].content == "ok"
     assert isinstance(result[2].content, list)
-
-
-# ── confirmation flow ────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_confirmation_approve() -> None:
-    _reset_confirmation_state()
-    from agent.tools.computer import (
-        request_confirmation,
-        resolve_confirmation,
-        wait_for_confirmation,
-    )
-
-    cid = request_confirmation("computer_click", {"x": 10, "y": 20})
-
-    async def _approve() -> None:
-        await asyncio.sleep(0.05)
-        resolve_confirmation(cid, True)
-
-    task = asyncio.create_task(_approve())
-    result = await wait_for_confirmation(cid)
-    await task
-
-    assert result is True
-
-
-@pytest.mark.asyncio
-async def test_confirmation_deny() -> None:
-    _reset_confirmation_state()
-    from agent.tools.computer import (
-        request_confirmation,
-        resolve_confirmation,
-        wait_for_confirmation,
-    )
-
-    cid = request_confirmation("computer_type_text", {"text": "hello"})
-    resolve_confirmation(cid, False)
-    result = await wait_for_confirmation(cid)
-    assert result is False
-
-
-@pytest.mark.asyncio
-async def test_confirmation_timeout() -> None:
-    _reset_confirmation_state()
-    from agent.tools.computer import wait_for_confirmation, request_confirmation
-
-    cid = request_confirmation("computer_click", {"x": 1, "y": 1})
-    result = await wait_for_confirmation(cid)
-    assert result is False
-
-
-@pytest.mark.asyncio
-async def test_unknown_confirm_id_returns_false() -> None:
-    _reset_confirmation_state()
-    from agent.tools.computer import wait_for_confirmation
-
-    result = await wait_for_confirmation("nonexistent")
-    assert result is False
-
-
-@pytest.mark.asyncio
-async def test_get_pending_confirmation() -> None:
-    _reset_confirmation_state()
-    from agent.tools.computer import get_pending_confirmation, request_confirmation
-
-    cid = request_confirmation("computer_click", {"x": 42, "y": 99})
-    info = get_pending_confirmation(cid)
-    assert info is not None
-    assert info["tool_name"] == "computer_click"
-    assert info["arguments"] == {"x": 42, "y": 99}
-
-    info_missing = get_pending_confirmation("bogus")
-    assert info_missing is None
-
-
-# ── confirmation gating ──────────────────────────────────────────────
-
-
-def test_readonly_tools_skip_confirmation() -> None:
-    _reset_confirmation_state()
-    from agent.tools.computer import READONLY_TOOLS, _needs_confirm
-
-    for name in READONLY_TOOLS:
-        assert _needs_confirm(name) is False
-
-
-def test_destructive_tools_require_confirmation_when_enabled() -> None:
-    _reset_confirmation_state()
-    from agent.tools.computer import _needs_confirm
-
-    destructive = [
-        "computer_click",
-        "computer_type_text",
-        "computer_hotkey",
-        "computer_scroll",
-        "computer_drag",
-        "computer_move_mouse",
-    ]
-    for name in destructive:
-        assert _needs_confirm(name) is True
-
-
-def test_confirm_disabled_skips_all() -> None:
-    _reset_confirmation_state()
-    from agent.tools.computer import _needs_confirm, set_confirm_config
-
-    set_confirm_config(enabled=False)
-    for name in ["computer_click", "computer_type_text", "computer_hotkey"]:
-        assert _needs_confirm(name) is False
-
-
-def test_set_confirm_config_timeout() -> None:
-    _reset_confirmation_state()
-    from agent.tools import computer as cc
-
-    cc.set_confirm_config(enabled=True, timeout=30.0)
-    assert cc._confirm_timeout == 30.0

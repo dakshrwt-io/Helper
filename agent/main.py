@@ -2,16 +2,23 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import os
+import secrets
+import time
 from contextlib import asynccontextmanager
+from collections import defaultdict, deque
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 
 from agent.shared import get_graph, get_chat_lock, get_chat_bus
+from agent.tools.computer import grant_desktop_lease, revoke_desktop_lease
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -20,6 +27,8 @@ logger = logging.getLogger("agent.web")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if not _web_token():
+        raise RuntimeError("WEB_TOKEN must be set")
     graph = get_graph()
     if graph:
         logger.info("AgentGraph ready. tools=%d", len(graph.mcp.tool_names) if graph.mcp else 0)
@@ -28,30 +37,60 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+_COOKIE_NAME = "helper_session"
+_login_attempts: dict[str, deque[float]] = defaultdict(deque)
 
 
-def _daily_cap() -> float:
-    raw = os.environ.get("DAILY_COST_USD", "1.0")
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        logger.warning("Invalid DAILY_COST_USD=%r; using 1.0", raw)
-        return 1.0
+def _web_token() -> str:
+    return os.environ.get("WEB_TOKEN", "")
+
+
+def _sign_session(session_id: str) -> str:
+    signature = hmac.new(
+        _web_token().encode(), session_id.encode(), hashlib.sha256
+    ).hexdigest()
+    return f"{session_id}.{signature}"
+
+
+def _verify_session(value: str | None) -> str | None:
+    if not value or "." not in value or not _web_token():
+        return None
+    session_id, signature = value.rsplit(".", 1)
+    expected = _sign_session(session_id).rsplit(".", 1)[1]
+    if not hmac.compare_digest(signature, expected):
+        return None
+    return session_id if session_id.startswith("web_") else None
+
+
+def _origin_allowed(ws: WebSocket) -> bool:
+    origin = ws.headers.get("origin")
+    if not origin:
+        return bool(ws.headers.get("authorization"))
+    allowed = {
+        value.strip()
+        for value in os.environ.get("WEB_ALLOWED_ORIGINS", "").split(",")
+        if value.strip()
+    }
+    if origin in allowed:
+        return True
+    parsed = urlparse(origin)
+    return parsed.netloc == ws.headers.get("host")
+
+
+def _authenticate_ws(ws: WebSocket) -> str | None:
+    session_id = _verify_session(ws.cookies.get(_COOKIE_NAME))
+    if session_id:
+        return session_id
+    auth = ws.headers.get("authorization", "")
+    if auth.startswith("Bearer ") and hmac.compare_digest(
+        auth[7:], _web_token()
+    ):
+        return f"web_{secrets.token_hex(16)}"
+    return None
 
 
 def _tool_count(graph) -> int:
     return len(graph.mcp.tool_names) if graph and graph.mcp else 0
-
-
-def _spent_today(graph) -> float:
-    chatdb = getattr(graph, "_chatdb", None)
-    if chatdb is None:
-        return 0.0
-    try:
-        return float(chatdb.spent_today())
-    except Exception:
-        logger.exception("Failed to read daily spend")
-        return 0.0
 
 
 def _status_payload(graph=None) -> dict:
@@ -59,19 +98,13 @@ def _status_payload(graph=None) -> dict:
     return {
         "status": "ok",
         "tools": _tool_count(graph),
-        "spent_today": _spent_today(graph),
-        "daily_cap": _daily_cap(),
     }
 
 
 def _answer_payload(result: dict, graph=None) -> dict:
-    status = _status_payload(graph)
     return {
         "type": "answer",
         "text": result["text"],
-        "cost_spent": float(result.get("cost_spent", 0.0)),
-        "spent_today": status["spent_today"],
-        "daily_cap": status["daily_cap"],
     }
 
 
@@ -80,9 +113,52 @@ async def index():
     return FileResponse(os.path.join(os.path.dirname(__file__), "web", "index.html"))
 
 
+@app.post("/auth/login")
+async def login(request: Request):
+    now = time.monotonic()
+    address = request.client.host if request.client else "unknown"
+    attempts = _login_attempts[address]
+    while attempts and attempts[0] < now - 60:
+        attempts.popleft()
+    if len(attempts) >= 5:
+        return JSONResponse({"error": "Too many attempts"}, status_code=429)
+    attempts.append(now)
+
+    try:
+        supplied = str((await request.json()).get("token", ""))
+    except (json.JSONDecodeError, AttributeError):
+        supplied = ""
+    expected = _web_token()
+    if not expected or not hmac.compare_digest(supplied, expected):
+        return JSONResponse({"error": "Invalid token"}, status_code=401)
+
+    attempts.clear()
+    session_id = f"web_{secrets.token_hex(16)}"
+    response = JSONResponse({"status": "ok"})
+    response.set_cookie(
+        _COOKIE_NAME,
+        _sign_session(session_id),
+        httponly=True,
+        samesite="strict",
+        secure=os.environ.get("WEB_COOKIE_SECURE", "").lower() == "true",
+        max_age=86400,
+    )
+    return response
+
+
+@app.post("/auth/logout")
+async def logout(request: Request):
+    session_id = _verify_session(request.cookies.get(_COOKIE_NAME))
+    if session_id:
+        revoke_desktop_lease(session_id)
+    response = JSONResponse({"status": "ok"})
+    response.delete_cookie(_COOKIE_NAME)
+    return response
+
+
 @app.get("/health")
 async def health():
-    return JSONResponse(_status_payload())
+    return JSONResponse({"status": "ok"})
 
 
 async def _run_chat_with_trace(ws: WebSocket, user_text: str, session_id: str) -> dict:
@@ -91,7 +167,7 @@ async def _run_chat_with_trace(ws: WebSocket, user_text: str, session_id: str) -
     trace_queue: asyncio.Queue[dict] = asyncio.Queue()
 
     async def _locked_chat():
-        async with get_chat_lock():
+        async with get_chat_lock(session_id):
             return await graph.chat(user_text, session_id=session_id, trace_queue=trace_queue)
 
     chat_task = asyncio.create_task(_locked_chat())
@@ -135,8 +211,12 @@ async def _run_chat_with_trace(ws: WebSocket, user_text: str, session_id: str) -
 
 @app.websocket("/chat")
 async def chat_ws(ws: WebSocket):
+    session_id = _authenticate_ws(ws)
+    if not session_id or not _origin_allowed(ws):
+        await ws.close(code=4401)
+        return
     await ws.accept()
-    logger.info("WS connected")
+    logger.info("WS connected session=%s", session_id)
 
     bus = get_chat_bus()
     bus_queue: asyncio.Queue = asyncio.Queue()
@@ -145,7 +225,7 @@ async def chat_ws(ws: WebSocket):
     async def _relay(event: dict) -> None:
         await bus_queue.put(event)
 
-    sub_id = await bus.subscribe(_relay)
+    sub_id = await bus.subscribe(session_id, _relay)
 
     async def _forwarder() -> None:
         while True:
@@ -158,7 +238,7 @@ async def chat_ws(ws: WebSocket):
                 break
 
     fwd_task = asyncio.create_task(_forwarder())
-    _history_sent: dict[str, bool] = {}
+    history_sent = False
 
     try:
         graph = get_graph()
@@ -167,19 +247,32 @@ async def chat_ws(ws: WebSocket):
             raw = await ws.receive_text()
             try:
                 data = json.loads(raw)
+                if data.get("type") == "desktop_lease":
+                    enabled = bool(data.get("enabled"))
+                    if enabled:
+                        seconds = grant_desktop_lease(session_id)
+                        payload = {
+                            "type": "desktop_lease",
+                            "enabled": True,
+                            "seconds": seconds,
+                        }
+                    else:
+                        revoke_desktop_lease(session_id)
+                        payload = {"type": "desktop_lease", "enabled": False}
+                    async with ws_lock:
+                        await ws.send_json(payload)
+                    continue
                 user_text = data.get("text", "").strip()
-                session_id = data.get("session_id", "default")
             except json.JSONDecodeError:
                 user_text = raw.strip()
-                session_id = "default"
 
             if not user_text:
                 async with ws_lock:
                     await ws.send_json({"type": "error", "text": "Empty message"})
                 continue
 
-            if graph and graph._chatdb and not _history_sent.get(session_id):
-                _history_sent[session_id] = True
+            if graph and graph._chatdb and not history_sent:
+                history_sent = True
                 history = graph._chatdb.get_history(session_id, limit=50)
                 if history:
                     async with ws_lock:
@@ -210,6 +303,7 @@ async def chat_ws(ws: WebSocket):
     except WebSocketDisconnect:
         logger.info("WS disconnected")
     finally:
+        revoke_desktop_lease(session_id)
         await bus.unsubscribe(sub_id)
         fwd_task.cancel()
         try:

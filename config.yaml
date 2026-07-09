@@ -40,7 +40,7 @@ memory:
 web:
   port: ${WEB_PORT}
   host: 127.0.0.1
-  auth: false
+  auth: true
 
 telegram:
   enabled: ${TELEGRAM_ENABLED}
@@ -49,8 +49,8 @@ telegram:
 
 computer_control:
   enabled: ${COMPUTER_CONTROL_ENABLED}
-  confirm_actions: ${COMPUTER_CONTROL_CONFIRM}
-  confirm_timeout: 60
+  lease_seconds: 300
+  rate_limit: 30
 
 agent:
   persona_path: ${PERSONA_PATH}

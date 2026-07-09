@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
+import time
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from typing import Any
@@ -35,7 +37,10 @@ class MCPManager:
         self.config_path = config_path
         self._servers: dict[str, MCPServerConfig] = {}
         self._sessions: dict[str, ClientSession] = {}
-        self._exit_stack: AsyncExitStack | None = None
+        self._server_stacks: dict[str, AsyncExitStack] = {}
+        self._server_locks: dict[str, asyncio.Lock] = {}
+        self._restart_failures: dict[str, int] = {}
+        self._retry_after: dict[str, float] = {}
         self._tools: dict[str, str] = {}  # tool_name -> server_name
         self._tool_defs: dict[str, MCPTool] = {}
         self._loaded = False
@@ -82,38 +87,57 @@ class MCPManager:
             return
         cfg = self._load_config()
         self._parse_servers(cfg.get("mcp", {}))
-        self._exit_stack = AsyncExitStack()
-
-        for name, srv in self._servers.items():
+        for name in self._servers:
             try:
-                params = StdioServerParameters(command=srv.command, args=srv.args)
-                stdio_transport = await self._exit_stack.enter_async_context(
-                    stdio_client(params)
-                )
-                read, write = stdio_transport
-                session = await self._exit_stack.enter_async_context(
-                    ClientSession(read, write)
-                )
-                await session.initialize()
-                self._sessions[name] = session
-                self._healthy[name] = True
-
-                tools_resp = await session.list_tools()
-                for t in tools_resp.tools:
-                    self._tools[t.name] = name
-                    self._tool_defs[t.name] = t
-                logger.info(
-                    "MCP server '%s' started, %d tools: %s",
-                    name,
-                    len(tools_resp.tools),
-                    [t.name for t in tools_resp.tools],
-                )
+                await self._connect_server(name)
             except Exception as e:
                 logger.error("Failed to start MCP server '%s': %s", name, e)
                 self._healthy[name] = False
+                self._schedule_retry(name)
 
         self._start_health_monitor()
         self._loaded = True
+
+    async def _connect_server(self, name: str) -> None:
+        srv = self._servers[name]
+        stack = AsyncExitStack()
+        try:
+            params = StdioServerParameters(command=srv.command, args=srv.args)
+            read, write = await stack.enter_async_context(stdio_client(params))
+            session = await stack.enter_async_context(ClientSession(read, write))
+            await session.initialize()
+            tools = (await session.list_tools()).tools
+        except BaseException:
+            await stack.aclose()
+            raise
+
+        old_stack = self._server_stacks.pop(name, None)
+        self._sessions[name] = session
+        self._server_stacks[name] = stack
+        for tool_name, server_name in list(self._tools.items()):
+            if server_name == name:
+                self._tools.pop(tool_name, None)
+                self._tool_defs.pop(tool_name, None)
+        for tool in tools:
+            self._tools[tool.name] = name
+            self._tool_defs[tool.name] = tool
+        self._healthy[name] = True
+        self._restart_failures[name] = 0
+        self._retry_after.pop(name, None)
+        if old_stack:
+            try:
+                await asyncio.wait_for(old_stack.aclose(), timeout=5)
+            except Exception as exc:
+                logger.debug("Old MCP server '%s' cleanup failed: %s", name, exc)
+        logger.info("MCP server '%s' ready, %d tools", name, len(tools))
+
+    def _schedule_retry(self, name: str) -> None:
+        failures = self._restart_failures.get(name, 0) + 1
+        self._restart_failures[name] = failures
+        delay = min(300.0, 5.0 * (2 ** (failures - 1)))
+        self._retry_after[name] = (
+            time.monotonic() + delay + random.uniform(0, delay * 0.1)
+        )
 
     async def list_tools_async(self) -> list[MCPTool]:
         """Fetch current tool list from all live sessions."""
@@ -143,9 +167,13 @@ class MCPManager:
                 f"MCP server '{server_name}' is unhealthy. "
                 f"Tool '{tool_name}' is unavailable."
             )
-        session = self._sessions[server_name]
-        result = await session.call_tool(tool_name, arguments=arguments or {})
-        return result
+        lock = self._server_locks.setdefault(server_name, asyncio.Lock())
+        async with lock:
+            if not self._healthy.get(server_name, False):
+                raise RuntimeError(f"MCP server '{server_name}' is unavailable")
+            return await self._sessions[server_name].call_tool(
+                tool_name, arguments=arguments or {}
+            )
 
     # ── health monitor ────────────────────────────────────────────
 
@@ -160,16 +188,25 @@ class MCPManager:
 
     async def _health_loop(self) -> None:
         while True:
-            await asyncio.sleep(self._health_interval)
-            for name in list(self._sessions.keys()):
+            await asyncio.sleep(min(self._health_interval, 5.0))
+            for name in list(self._servers):
                 await self._ping_server(name)
 
     async def _ping_server(self, name: str) -> None:
-        session = self._sessions.get(name)
-        if session is None:
-            self._healthy[name] = False
+        if (
+            not self._healthy.get(name, False)
+            and time.monotonic() < self._retry_after.get(name, 0)
+        ):
             return
+        lock = self._server_locks.setdefault(name, asyncio.Lock())
+        async with lock:
+            await self._ping_or_restart(name)
+
+    async def _ping_or_restart(self, name: str) -> None:
+        session = self._sessions.get(name)
         try:
+            if session is None:
+                raise RuntimeError("server has no session")
             await asyncio.wait_for(session.list_tools(), timeout=10.0)
             if not self._healthy.get(name):
                 logger.info("MCP server '%s' recovered — marked healthy", name)
@@ -179,6 +216,14 @@ class MCPManager:
             self._healthy[name] = False
             level = logging.WARNING if was_healthy else logging.DEBUG
             logger.log(level, "MCP server '%s' health check failed: %s", name, exc)
+            try:
+                await self._connect_server(name)
+            except Exception as restart_exc:
+                self._healthy[name] = False
+                self._schedule_retry(name)
+                logger.log(
+                    level, "MCP server '%s' restart failed: %s", name, restart_exc
+                )
 
     @property
     def healthy_servers(self) -> list[str]:
@@ -187,8 +232,14 @@ class MCPManager:
     async def stop(self) -> None:
         """Shut down all MCP server subprocesses."""
         self._stop_health_monitor()
-        if self._exit_stack:
-            await self._exit_stack.aclose()
+        if self._health_task:
+            await asyncio.gather(self._health_task, return_exceptions=True)
+        for stack in list(self._server_stacks.values()):
+            try:
+                await stack.aclose()
+            except Exception as exc:
+                logger.debug("MCP cleanup failed: %s", exc)
+        self._server_stacks.clear()
         self._sessions.clear()
         self._tools.clear()
         self._tool_defs.clear()

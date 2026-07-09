@@ -24,9 +24,8 @@ from agent.tools.computer import (
     clear_screenshots,
     get_computer_tools,
     inject_screenshots,
-    set_confirm_config,
 )
-from agent.shared import sanitize_aimessage
+from agent.shared import activate_session, sanitize_aimessage
 from agent.trace import TraceCollector, activate_trace, display_content, duration_ms
 
 logger = logging.getLogger(__name__)
@@ -203,10 +202,6 @@ class AgentGraph:
         phase_start = time.perf_counter()
         cc = self._cfg.get("computer_control", {})
         if str(cc.get("enabled", "")).lower() == "true":
-            set_confirm_config(
-                enabled=str(cc.get("confirm_actions", "true")).lower() == "true",
-                timeout=float(cc.get("confirm_timeout", 60)),
-            )
             tools.extend(get_computer_tools())
         logger.info(
             "Agent setup computer tools completed in %d ms",
@@ -359,13 +354,17 @@ class AgentGraph:
         g.add_edge("tools", "agent")
         self._graph = g.compile()
 
-    async def _recall_context(self, user_text: str, trace: TraceCollector) -> list[str]:
+    async def _recall_context(
+        self, user_text: str, session_id: str, trace: TraceCollector
+    ) -> list[str]:
         if not self._vector:
             return []
 
         recall_start = time.perf_counter()
         trace.emit("memory_recall_started")
-        hits = await asyncio.to_thread(self._vector.query, user_text, 3)
+        hits = await asyncio.to_thread(
+            self._vector.query, user_text, 3, session_id
+        )
         recalled = [h["text"] for h in hits if h.get("distance", 1.0) < 0.6]
         trace.emit(
             "memory_recall_completed",
@@ -473,11 +472,11 @@ class AgentGraph:
         trace = TraceCollector(queue=trace_queue)
         turn_start = time.perf_counter()
 
-        with activate_trace(trace):
+        with activate_session(session_id), activate_trace(trace):
             trace.emit("turn_started", session_id=session_id)
             clear_screenshots()
             try:
-                recalled = await self._recall_context(user_text, trace)
+                recalled = await self._recall_context(user_text, session_id, trace)
                 prior = await self._load_history_messages(session_id, trace)
                 msgs = self._build_turn_messages(user_text, recalled, prior)
                 state: AgentState = {
@@ -501,7 +500,6 @@ class AgentGraph:
                 )
                 return {
                     "text": final,
-                    "cost_spent": 0.0,
                     "messages": out_msgs,
                     "trace": trace.events,
                 }

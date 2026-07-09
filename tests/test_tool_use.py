@@ -20,7 +20,6 @@ async def main() -> None:
             print(f"[{data['type']}]")
             if data["type"] == "answer":
                 print(f"TEXT: {data['text'][:600]}")
-                print(f"cost: ${data['cost_spent']}, today: ${data['spent_today']}")
                 return
             if data["type"] == "error":
                 print(f"ERR: {data['text']}"); return

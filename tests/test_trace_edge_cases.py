@@ -1,4 +1,4 @@
-"""Unit tests for trace events on edge cases: cost cap block, tool failure, no-tools turn."""
+"""Unit tests for trace events on edge cases: tool failure, no-tools turn."""
 from __future__ import annotations
 
 import asyncio
@@ -20,7 +20,7 @@ class _FakeLLM:
         )
 
 
-def test_cost_cap_no_longer_blocks() -> None:
+def test_turn_completes_without_blocking() -> None:
     async def run() -> None:
         agent = AgentGraph()
         agent._cfg = {"agent": {"max_iterations": 3}}
@@ -31,13 +31,9 @@ def test_cost_cap_no_longer_blocks() -> None:
         agent._build_graph()
 
         class FakeDB:
-            def spent_today(self) -> float:
-                return 1.5
             def get_history(self, *a, **k):
                 return []
             def add_message(self, *a, **k):
-                pass
-            def add_cost(self, *a, **k):
                 pass
         agent._chatdb = FakeDB()
         agent._vector = None

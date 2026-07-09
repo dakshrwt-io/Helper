@@ -36,6 +36,19 @@ def test_query_skips_chroma_when_store_is_known_empty() -> None:
     assert store.query("hello") == []
 
 
+def test_query_scopes_results_to_session() -> None:
+    class FakeCollection:
+        def query(self, **kwargs):
+            assert kwargs["where"] == {"session_id": "session-a"}
+            return {"documents": [[]], "metadatas": [[]], "distances": [[]]}
+
+    store = VectorStore.__new__(VectorStore)
+    store._col = FakeCollection()
+    store._has_documents = True
+
+    assert store.query("secret", session_id="session-a") == []
+
+
 def test_rebuild_inserts_documents_in_batches() -> None:
     class FakeCollection:
         def __init__(self) -> None:

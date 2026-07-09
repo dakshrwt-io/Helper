@@ -12,9 +12,11 @@ env/
 # Secrets / local
 .env
 data/
+.agents/
 *.db
 *.sqlite*
 HANDOFF.md
+skills-lock.json
 
 # Logs
 *.log

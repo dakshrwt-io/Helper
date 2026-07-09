@@ -19,8 +19,6 @@ async def main() -> None:
             print(f"[{data['type']}]")
             if data["type"] == "answer":
                 print(f"TEXT: {data['text']}")
-                print(f"cost_spent: ${data['cost_spent']}")
-                print(f"spent_today: ${data['spent_today']} / ${data['daily_cap']}")
                 return
             if data["type"] == "error":
                 print(f"ERROR: {data['text']}")

@@ -15,6 +15,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger("run_server")
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 async def main() -> None:

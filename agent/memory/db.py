@@ -21,13 +21,6 @@ class MessageRow(Base):
     ts = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
-class CostRow(Base):
-    __tablename__ = "cost_log"
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    date = Column(String, index=True)  # YYYY-MM-DD UTC
-    spent = Column(Integer, default=0)  # micro-USD
-
-
 def _set_wal(dbapi_connection, _connection_record):
     dbapi_connection.execute("PRAGMA journal_mode=WAL")
     dbapi_connection.execute("PRAGMA busy_timeout=5000")
@@ -79,31 +72,6 @@ class ChatDB:
         finally:
             s.close()
 
-    def today_str(self) -> str:
-        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-    def add_cost(self, micro_usd: int) -> None:
-        d = self.today_str()
-        s = self.Session()
-        try:
-            row = s.scalar(select(CostRow).filter_by(date=d))
-            if row:
-                row.spent += micro_usd
-            else:
-                s.add(CostRow(date=d, spent=micro_usd))
-            s.commit()
-        finally:
-            s.close()
-
-    def spent_today(self) -> float:
-        d = self.today_str()
-        s = self.Session()
-        try:
-            row = s.scalar(select(CostRow).filter_by(date=d))
-            return (row.spent / 1_000_000.0) if row else 0.0
-        finally:
-            s.close()
-
     def export_all_turns(self) -> list[dict]:
         s = self.Session()
         try:
@@ -115,19 +83,16 @@ class ChatDB:
             s.close()
 
         turns: list[dict] = []
-        pending_user: MessageRow | None = None
+        pending_users: dict[str, MessageRow] = {}
         for row in rows:
             if row.role == "user":
-                if pending_user is not None:
-                    pending_user = row
-                else:
-                    pending_user = row
-            elif row.role == "assistant" and pending_user is not None:
+                pending_users[row.session_id] = row
+            elif row.role == "assistant" and row.session_id in pending_users:
+                pending_user = pending_users.pop(row.session_id)
                 user_text = pending_user.content or ""
                 assistant_text = row.content or ""
                 turns.append({
                     "session_id": row.session_id,
                     "text": f"User: {user_text}\nAssistant: {assistant_text}",
                 })
-                pending_user = None
         return turns

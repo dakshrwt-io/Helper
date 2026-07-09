@@ -25,7 +25,6 @@ async def main() -> None:
     res = await ag.chat("List the files in the allowed directory using the filesystem tool.")
     print("\n--- RESPONSE ---")
     print(res["text"][:500])
-    print(f"\nCost: ${res['cost_spent']:.6f}")
 
     await ag.close()
 

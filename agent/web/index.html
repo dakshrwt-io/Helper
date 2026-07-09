@@ -60,24 +60,43 @@
   #send { background: #0f3460; color: #4ecca3; border: none; padding: 10px 20px; border-radius: 8px; cursor: pointer; font-size: 14px; font-weight: 600; }
   #send:hover { background: #1a4a8a; }
   #send:disabled { opacity: 0.5; cursor: not-allowed; }
+  #controls { display: flex; gap: 8px; align-items: center; }
+  #controls button { background: #0f3460; color: #e0e0e0; border: 0; padding: 6px 10px; border-radius: 6px; cursor: pointer; }
+  #login { position: fixed; inset: 0; z-index: 10; background: #1a1a2e; display: none; place-items: center; }
+  #login form { width: min(360px, 90vw); display: grid; gap: 12px; }
+  #login input, #login button { padding: 10px; border-radius: 8px; }
 </style>
 </head>
 <body>
 <header>
   <h1>Personal AI Agent</h1>
-  <div id="status">connecting...</div>
+  <div id="controls">
+    <button id="desktop" type="button">Desktop: off</button>
+    <button id="logout" type="button">Logout</button>
+    <div id="status">connecting...</div>
+  </div>
 </header>
 <div id="messages"></div>
 <div id="input-bar">
   <input id="input" type="text" placeholder="Message your agent..." autocomplete="off" />
   <button id="send">Send</button>
 </div>
+<div id="login">
+  <form id="login-form">
+    <h2>Sign in</h2>
+    <input id="token" type="password" placeholder="Web token" autocomplete="current-password" required />
+    <button type="submit">Sign in</button>
+    <div id="login-error" class="msg error"></div>
+  </form>
+</div>
 <script>
-const wsUrl = `ws://${location.host}/chat`;
+const wsUrl = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/chat`;
 const msgs = document.getElementById('messages');
 const input = document.getElementById('input');
 const sendBtn = document.getElementById('send');
 const status = document.getElementById('status');
+const loginView = document.getElementById('login');
+const desktopBtn = document.getElementById('desktop');
 let ws;
 let busy = false;
 let activeTrace = null;
@@ -129,20 +148,10 @@ function scrollToBottom() {
   msgs.scrollTop = msgs.scrollHeight;
 }
 
-function formatMoney(value) {
-  const n = Number(value);
-  return Number.isFinite(n) ? n.toFixed(4) : null;
-}
-
 function updateStatus(data) {
   const parts = ['<span class="ok">online</span>'];
   if (data && Number.isFinite(Number(data.tools))) {
     parts.push(`${Number(data.tools)} tools`);
-  }
-  const spent = formatMoney(data && data.spent_today);
-  const cap = data && Number.isFinite(Number(data.daily_cap)) ? Number(data.daily_cap) : null;
-  if (spent !== null && cap !== null) {
-    parts.push(`$${spent}/${cap}`);
   }
   status.innerHTML = parts.join(' | ');
 }
@@ -332,6 +341,9 @@ function handleMessage(e) {
     addMsg('assistant', data.text);
     updateStatus(data);
     setBusy(false);
+  } else if (data.type === 'desktop_lease') {
+    desktopBtn.textContent = `Desktop: ${data.enabled ? 'on' : 'off'}`;
+    desktopBtn.dataset.enabled = data.enabled ? 'true' : 'false';
   } else if (data.type === 'error') {
     msgs.querySelectorAll('.msg.thinking').forEach(t => t.remove());
     addMsg('error', data.text);
@@ -358,10 +370,15 @@ function connect() {
     }).catch(function () {});
     setBusy(false);
   };
-  ws.onclose = function () {
+  ws.onclose = function (event) {
     clearTrace();
     msgs.querySelectorAll('.msg.thinking').forEach(function (t) { t.remove(); });
     setBusy(false);
+    if (event.code === 4401) {
+      loginView.style.display = 'grid';
+      status.textContent = 'authentication required';
+      return;
+    }
     if (reconnectAttempts >= maxReconnectAttempts) {
       status.textContent = '● Connection lost. Refresh to reconnect.';
       return;
@@ -386,15 +403,43 @@ function send() {
   input.value = '';
   setBusy(true);
   if (!ws || ws.readyState !== WebSocket.OPEN) {
-    pendingMessages.push({ text: text, session_id: 'default' });
+    pendingMessages.push({ text: text });
     addMsg('error', 'Message queued — reconnecting...');
     return;
   }
-  ws.send(JSON.stringify({ text: text, session_id: 'default' }));
+  ws.send(JSON.stringify({ text: text }));
 }
 
 sendBtn.onclick = send;
 input.onkeydown = (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } };
+desktopBtn.onclick = function () {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({
+    type: 'desktop_lease',
+    enabled: desktopBtn.dataset.enabled !== 'true'
+  }));
+};
+document.getElementById('logout').onclick = async function () {
+  await fetch('/auth/logout', {method: 'POST'});
+  if (ws) ws.close();
+  loginView.style.display = 'grid';
+};
+document.getElementById('login-form').onsubmit = async function (event) {
+  event.preventDefault();
+  const response = await fetch('/auth/login', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({token: document.getElementById('token').value})
+  });
+  if (!response.ok) {
+    document.getElementById('login-error').textContent = 'Invalid token';
+    return;
+  }
+  document.getElementById('token').value = '';
+  loginView.style.display = 'none';
+  reconnectAttempts = 0;
+  connect();
+};
 connect();
 </script>
 </body>

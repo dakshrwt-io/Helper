@@ -1,29 +1,23 @@
 """Computer control tools using PyAutoGUI for Windows desktop automation.
 
-Destructive actions (click, type, scroll, drag, hotkey) are gated through a
-user-confirmation system.  Read-only actions (screenshot, get-position, get-
-screen-size) execute immediately.
-
-Confirmation events flow through the trace collector / ChatBus so both the web
-UI and Telegram can present allow/deny prompts.
+All actions (screenshot, mouse, keyboard, scroll, drag) execute immediately.
 """
 from __future__ import annotations
 
 import asyncio
 import base64
 import io
-import logging
+import os
 import time
+from collections import defaultdict, deque
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
 
-from agent.shared import sanitize_aimessage
+from agent.shared import get_active_session_id, sanitize_aimessage
 from agent.trace import duration_ms, get_active_trace
-
-logger = logging.getLogger(__name__)
 
 # ── PyAutoGUI availability ──────────────────────────────────────────
 _pyautogui_ok = True
@@ -45,24 +39,74 @@ def _ensure_pyautogui() -> None:
 
 # ── Screenshot storage (FIFO) for multimodal injection into LLM ─────
 _MAX_SCREENSHOTS = 5
-_screenshots: list[str] = []
+_screenshots: dict[str, list[str]] = defaultdict(list)
+
+
+def _screenshot_buffer() -> list[str]:
+    return _screenshots[get_active_session_id() or "__unscoped__"]
 
 
 def _push_screenshot(b64: str) -> None:
-    if len(_screenshots) >= _MAX_SCREENSHOTS:
-        _screenshots.pop(0)
-    _screenshots.append(b64)
+    screenshots = _screenshot_buffer()
+    if len(screenshots) >= _MAX_SCREENSHOTS:
+        screenshots.pop(0)
+    screenshots.append(b64)
 
 
 def _pop_screenshot() -> str | None:
-    if _screenshots:
-        return _screenshots.pop(0)
+    screenshots = _screenshot_buffer()
+    if screenshots:
+        return screenshots.pop(0)
     return None
 
 
 def clear_screenshots() -> None:
-    _screenshots.clear()
+    _screenshots.pop(get_active_session_id() or "__unscoped__", None)
     return None
+
+
+READ_ONLY_TOOLS = frozenset(
+    {
+        "computer_screenshot",
+        "computer_get_screen_size",
+        "computer_get_mouse_position",
+    }
+)
+_desktop_leases: dict[str, float] = {}
+_desktop_actions: dict[str, deque[float]] = defaultdict(deque)
+
+
+def grant_desktop_lease(session_id: str) -> int:
+    seconds = min(
+        300, max(1, int(os.environ.get("COMPUTER_CONTROL_LEASE_SECONDS", "300")))
+    )
+    _desktop_leases[session_id] = time.monotonic() + seconds
+    _desktop_actions.pop(session_id, None)
+    return seconds
+
+
+def revoke_desktop_lease(session_id: str) -> None:
+    _desktop_leases.pop(session_id, None)
+    _desktop_actions.pop(session_id, None)
+
+
+def _authorize_action(tool_name: str) -> None:
+    if tool_name in READ_ONLY_TOOLS:
+        return
+    session_id = get_active_session_id()
+    if not session_id or _desktop_leases.get(session_id, 0) <= time.monotonic():
+        if session_id:
+            revoke_desktop_lease(session_id)
+        raise PermissionError("Desktop control requires an active user-approved lease")
+
+    limit = max(1, int(os.environ.get("COMPUTER_CONTROL_RATE_LIMIT", "30")))
+    now = time.monotonic()
+    actions = _desktop_actions[session_id]
+    while actions and actions[0] <= now - 60:
+        actions.popleft()
+    if len(actions) >= limit:
+        raise PermissionError("Desktop control rate limit exceeded")
+    actions.append(now)
 
 
 def inject_screenshots(messages: list[Any]) -> list[Any]:
@@ -90,76 +134,6 @@ def inject_screenshots(messages: list[Any]) -> list[Any]:
     return result
 
 
-# ── Confirmation subsystem ──────────────────────────────────────────
-_pending: dict[str, tuple[asyncio.Event, dict[str, Any]]] = {}
-_results: dict[str, bool] = {}
-_confirm_enabled: bool = True
-_confirm_timeout: float = 60.0
-
-READONLY_TOOLS = frozenset(
-    {
-        "computer_screenshot",
-        "computer_get_screen_size",
-        "computer_get_mouse_position",
-    }
-)
-
-
-def set_confirm_config(*, enabled: bool, timeout: float = 60.0) -> None:
-    global _confirm_enabled, _confirm_timeout
-    _confirm_enabled = enabled
-    _confirm_timeout = timeout
-
-
-def request_confirmation(tool_name: str, arguments: dict[str, Any]) -> str:
-    confirm_id = f"{tool_name}_{int(time.time() * 1000)}"
-    event = asyncio.Event()
-    _pending[confirm_id] = (event, {"tool_name": tool_name, "arguments": arguments})
-    trace = get_active_trace()
-    if trace:
-        args_summary = ", ".join(f"{k}={v!r}" for k, v in arguments.items())
-        trace.emit(
-            "confirmation_needed",
-            confirm_id=confirm_id,
-            tool_name=tool_name,
-            arguments=arguments,
-            description=f"{tool_name}({args_summary})",
-        )
-    return confirm_id
-
-
-def resolve_confirmation(confirm_id: str, approved: bool) -> None:
-    """Called by web / Telegram handlers to approve or deny a pending action."""
-    _results[confirm_id] = approved
-    entry = _pending.pop(confirm_id, None)
-    if entry:
-        event, _ = entry
-        event.set()
-
-
-def get_pending_confirmation(confirm_id: str) -> dict[str, Any] | None:
-    entry = _pending.get(confirm_id)
-    return entry[1] if entry else None
-
-
-async def wait_for_confirmation(confirm_id: str) -> bool:
-    entry = _pending.get(confirm_id)
-    if not entry:
-        return False
-    event, _ = entry
-    try:
-        await asyncio.wait_for(event.wait(), timeout=_confirm_timeout)
-        return _results.pop(confirm_id, False)
-    except asyncio.TimeoutError:
-        _pending.pop(confirm_id, None)
-        logger.warning("Confirmation %s timed out after %.0fs", confirm_id, _confirm_timeout)
-        return False
-
-
-def _needs_confirm(tool_name: str) -> bool:
-    return _confirm_enabled and tool_name not in READONLY_TOOLS
-
-
 # ── Trace-aware tool wrapper ────────────────────────────────────────
 def _wrap_tool(
     name: str,
@@ -174,6 +148,7 @@ def _wrap_tool(
         if trace:
             trace.emit("tool_started", tool_name=name, server="computer", arguments=clean_args)
         try:
+            _authorize_action(name)
             result = await execute(**clean_args)
         except Exception as exc:
             if trace:
@@ -287,51 +262,30 @@ async def _exec_get_mouse_position(**kwargs: Any) -> str:
 
 
 async def _exec_move_mouse(x: int, y: int) -> str:
-    if _needs_confirm("computer_move_mouse"):
-        cid = request_confirmation("computer_move_mouse", {"x": x, "y": y})
-        if not await wait_for_confirmation(cid):
-            return "Action denied by user."
     _ensure_pyautogui()
     await asyncio.to_thread(pyautogui.moveTo, x, y)
     return f"Moved mouse to ({x}, {y})"
 
 
 async def _exec_click(x: int, y: int, button: str = "left") -> str:
-    if _needs_confirm("computer_click"):
-        cid = request_confirmation("computer_click", {"x": x, "y": y, "button": button})
-        if not await wait_for_confirmation(cid):
-            return "Action denied by user."
     _ensure_pyautogui()
     await asyncio.to_thread(pyautogui.click, x, y, button=button)
     return f"Clicked {button} at ({x}, {y})"
 
 
 async def _exec_double_click(x: int, y: int) -> str:
-    if _needs_confirm("computer_double_click"):
-        cid = request_confirmation("computer_double_click", {"x": x, "y": y})
-        if not await wait_for_confirmation(cid):
-            return "Action denied by user."
     _ensure_pyautogui()
     await asyncio.to_thread(pyautogui.doubleClick, x, y)
     return f"Double-clicked at ({x}, {y})"
 
 
 async def _exec_right_click(x: int, y: int) -> str:
-    if _needs_confirm("computer_right_click"):
-        cid = request_confirmation("computer_right_click", {"x": x, "y": y})
-        if not await wait_for_confirmation(cid):
-            return "Action denied by user."
     _ensure_pyautogui()
     await asyncio.to_thread(pyautogui.rightClick, x, y)
     return f"Right-clicked at ({x}, {y})"
 
 
 async def _exec_type_text(text: str, interval: float = 0.05) -> str:
-    if _needs_confirm("computer_type_text"):
-        preview = text if len(text) <= 80 else text[:77] + "..."
-        cid = request_confirmation("computer_type_text", {"text": preview})
-        if not await wait_for_confirmation(cid):
-            return "Action denied by user."
     _ensure_pyautogui()
     await asyncio.to_thread(pyautogui.write, text, interval=interval)
     preview = text if len(text) <= 60 else text[:57] + "..."
@@ -339,20 +293,12 @@ async def _exec_type_text(text: str, interval: float = 0.05) -> str:
 
 
 async def _exec_press_key(key: str) -> str:
-    if _needs_confirm("computer_press_key"):
-        cid = request_confirmation("computer_press_key", {"key": key})
-        if not await wait_for_confirmation(cid):
-            return "Action denied by user."
     _ensure_pyautogui()
     await asyncio.to_thread(pyautogui.press, key)
     return f"Pressed key: {key}"
 
 
 async def _exec_hotkey(keys: str) -> str:
-    if _needs_confirm("computer_hotkey"):
-        cid = request_confirmation("computer_hotkey", {"keys": keys})
-        if not await wait_for_confirmation(cid):
-            return "Action denied by user."
     _ensure_pyautogui()
     combo = [k.strip().lower() for k in keys.split("+")]
     await asyncio.to_thread(pyautogui.hotkey, *combo)
@@ -362,10 +308,6 @@ async def _exec_hotkey(keys: str) -> str:
 
 
 async def _exec_scroll(clicks: int) -> str:
-    if _needs_confirm("computer_scroll"):
-        cid = request_confirmation("computer_scroll", {"clicks": clicks})
-        if not await wait_for_confirmation(cid):
-            return "Action denied by user."
     _ensure_pyautogui()
     await asyncio.to_thread(pyautogui.scroll, clicks)
     direction = "up" if clicks > 0 else "down"
@@ -375,13 +317,6 @@ async def _exec_scroll(clicks: int) -> str:
 async def _exec_drag(
     start_x: int, start_y: int, end_x: int, end_y: int, duration: float = 0.5
 ) -> str:
-    if _needs_confirm("computer_drag"):
-        cid = request_confirmation(
-            "computer_drag",
-            {"start_x": start_x, "start_y": start_y, "end_x": end_x, "end_y": end_y},
-        )
-        if not await wait_for_confirmation(cid):
-            return "Action denied by user."
     _ensure_pyautogui()
     await asyncio.to_thread(pyautogui.moveTo, start_x, start_y)
     await asyncio.to_thread(pyautogui.drag, end_x - start_x, end_y - start_y, duration=duration)
@@ -394,7 +329,6 @@ async def _exec_drag(
 def get_computer_tools() -> list[StructuredTool]:
     """Build and return all computer-control StructuredTools."""
     return [
-        # read-only — no confirmation needed
         _wrap_tool(
             "computer_screenshot",
             "Capture a screenshot of the entire primary screen. Use this when you need "
@@ -415,7 +349,6 @@ def get_computer_tools() -> list[StructuredTool]:
             BaseModel,
             _exec_get_mouse_position,
         ),
-        # destructive — may require confirmation
         _wrap_tool(
             "computer_move_mouse",
             "Move the mouse cursor to absolute (x, y) coordinates on the primary "

@@ -56,10 +56,15 @@ class VectorStore:
         if ids:
             self._has_documents = True
 
-    def query(self, text: str, top_k: int = 5) -> list[dict[str, Any]]:
+    def query(
+        self, text: str, top_k: int = 5, session_id: str | None = None
+    ) -> list[dict[str, Any]]:
         if not self._has_documents:
             return []
-        res = self._col.query(query_texts=[text], n_results=top_k)
+        kwargs: dict[str, Any] = {"query_texts": [text], "n_results": top_k}
+        if session_id is not None:
+            kwargs["where"] = {"session_id": session_id}
+        res = self._col.query(**kwargs)
         out: list[dict[str, Any]] = []
         docs = (res.get("documents") or [[]])[0]
         metas = (res.get("metadatas") or [[]])[0]
