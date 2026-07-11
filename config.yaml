@@ -23,6 +23,10 @@ llm:
     model: ${GROQ_MODEL}
     api_key: ${GROQ_API_KEY}
     base_url: ${GROQ_BASE_URL}
+  vision:
+    model: ${VISION_MODEL}
+    api_key: ${VISION_API_KEY}
+    base_url: ${VISION_BASE_URL}
 
 mcp:
   filesystem:

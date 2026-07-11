@@ -58,8 +58,8 @@ class AgentGraph:
         self._vector: VectorStore | None = None
         self._llm_backend: str = "openrouter"
         self._model_name: str = ""
-        self._groq_llm: Any = None
-        self._groq_model: str = ""
+        self._vision_llm: Any = None
+        self._vision_model: str = ""
         self._subagent_manager: SubAgentManager | None = None
 
     def _load(self) -> None:
@@ -163,19 +163,19 @@ class AgentGraph:
                 max_retries=1,
             )
 
-        groq_cfg = llm_cfg.get("groq", {})
-        groq_key = groq_cfg.get("api_key", "")
-        if groq_key and groq_key not in ("", "gsk_REPLACE_ME"):
-            self._groq_model = groq_cfg.get("model", "meta-llama/llama-4-scout-17b-16e-instruct")
-            self._groq_llm = ChatOpenAI(
-                model=self._groq_model,
-                openai_api_key=groq_key,
-                openai_api_base=groq_cfg.get("base_url", "https://api.groq.com/openai/v1"),
+        vision_cfg = llm_cfg.get("vision", {})
+        vision_key = vision_cfg.get("api_key", "")
+        if vision_key and vision_key not in ("", "REPLACE_ME"):
+            self._vision_model = vision_cfg.get("model", "google/gemini-2.5-flash")
+            self._vision_llm = ChatOpenAI(
+                model=self._vision_model,
+                openai_api_key=vision_key,
+                openai_api_base=vision_cfg.get("base_url", "https://openrouter.ai/api/v1"),
                 temperature=0.0,
                 timeout=60,
                 max_retries=1,
             )
-            logger.info("Groq vision LLM ready: %s", self._groq_model)
+            logger.info("Vision LLM ready: %s", self._vision_model)
 
     async def setup(self) -> None:
         """Async init: load config, start MCP, build LLM+tools+graph."""
@@ -249,27 +249,27 @@ class AgentGraph:
             trace = state.get("trace")
             llm_call = state.get("llm_calls_made", 0) + 1
 
-            if self._groq_llm is not None and msgs and isinstance(msgs[-1], ToolMessage) and getattr(msgs[-1], "name", None) == "computer_screenshot":
+            if self._vision_llm is not None and msgs and isinstance(msgs[-1], ToolMessage) and getattr(msgs[-1], "name", None) == "computer_screenshot":
                 vision_start = time.perf_counter()
                 if trace:
                     trace.emit(
                         "vision_started",
-                        model=self._groq_model,
-                        backend="groq",
+                        model=self._vision_model,
+                        backend="vision",
                     )
                 try:
                     vision_msgs = inject_screenshots(msgs)
-                    groq_resp = await self._groq_llm.ainvoke(vision_msgs)
-                    msgs = msgs + [groq_resp]
+                    vision_resp = await self._vision_llm.ainvoke(vision_msgs)
+                    msgs = msgs + [vision_resp]
                     if trace:
                         trace.emit(
                             "vision_completed",
                             duration_ms=duration_ms(vision_start),
-                            content=display_content(groq_resp.content),
-                            usage=getattr(groq_resp, "usage_metadata", None) or {},
+                            content=display_content(vision_resp.content),
+                            usage=getattr(vision_resp, "usage_metadata", None) or {},
                         )
                 except Exception as exc:
-                    logger.warning("Groq vision call failed: %s", exc)
+                    logger.warning("Vision call failed: %s", exc)
                     if trace:
                         trace.emit(
                             "vision_failed",
