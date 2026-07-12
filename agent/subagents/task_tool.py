@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 
 from agent.subagents.manager import SubAgentManager
 from agent.subagents.types import SubAgentResult
+from agent.shared import get_active_session_id
 from agent.trace import duration_ms, get_active_trace
 
 
@@ -31,6 +32,7 @@ def build_task_tool(manager: SubAgentManager, chatdb: Any = None) -> StructuredT
 
     async def _run(subagent_type: str, description: str, context: str = "") -> str:
         trace = get_active_trace()
+        session_id = get_active_session_id() or ""
         start = time.perf_counter()
         if trace:
             trace.emit(
@@ -49,6 +51,7 @@ def build_task_tool(manager: SubAgentManager, chatdb: Any = None) -> StructuredT
                 description=description,
                 context=context,
                 trace=trace,
+                session_id=session_id,
             )
         except Exception as exc:
             if trace:

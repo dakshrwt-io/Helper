@@ -217,6 +217,8 @@ class AgentGraph:
                 llm=self._llm,
                 llm_backend=self._llm_backend,
                 model_name=self._model_name,
+                vision_llm=self._vision_llm,
+                vision_model=self._vision_model,
             )
             if self._subagent_manager.agent_names:
                 tools.append(build_task_tool(self._subagent_manager, self._chatdb))
@@ -260,7 +262,10 @@ class AgentGraph:
                 try:
                     vision_msgs = inject_screenshots(msgs)
                     vision_resp = await self._vision_llm.ainvoke(vision_msgs)
-                    msgs = msgs + [vision_resp]
+                    vision_text = display_content(vision_resp.content)
+                    msgs[-1] = msgs[-1].model_copy(
+                        update={"content": f"[Screen analysis]\n{vision_text}"}
+                    )
                     if trace:
                         trace.emit(
                             "vision_completed",

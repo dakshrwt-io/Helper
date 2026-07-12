@@ -4,15 +4,16 @@ import logging
 import time
 from typing import Any
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 from langgraph.graph import END, StateGraph
 from langgraph.prebuilt import ToolNode
 from typing_extensions import TypedDict
 
-from agent.shared import sanitize_aimessage
+from agent.shared import activate_session, sanitize_aimessage
 from agent.subagents.types import SubAgentConfig, SubAgentResult
 from agent.trace import TraceCollector, activate_trace, display_content, duration_ms
+from agent.tools.computer import clear_screenshots, inject_screenshots
 
 logger = logging.getLogger(__name__)
 
@@ -34,12 +35,16 @@ class SubAgentManager:
         llm: Any,
         llm_backend: str,
         model_name: str,
+        vision_llm: Any = None,
+        vision_model: str = "",
     ) -> None:
         self._mcp_tools = mcp_tools
         self._computer_tools = computer_tools
         self._llm = llm
         self._llm_backend = llm_backend
         self._model_name = model_name
+        self._vision_llm = vision_llm
+        self._vision_model = vision_model
 
         self._configs: dict[str, SubAgentConfig] = {}
         self._graphs: dict[str, Any] = {}
@@ -101,6 +106,44 @@ class SubAgentManager:
             msgs = [sanitize_aimessage(m) if isinstance(m, AIMessage) else m for m in msgs]
 
             trace = state.get("trace")
+
+            # ── Vision: analyse screenshot if last message is one ──
+            if self._vision_llm is not None and msgs and isinstance(msgs[-1], ToolMessage) and getattr(msgs[-1], "name", None) == "computer_screenshot":
+                vision_start = time.perf_counter()
+                if trace:
+                    trace.emit(
+                        "vision_started",
+                        subagent_type=subagent_type,
+                        model=self._vision_model,
+                        backend="vision",
+                    )
+                try:
+                    vision_msgs = inject_screenshots(msgs)
+                    vision_resp = await self._vision_llm.ainvoke(vision_msgs)
+                    vision_text = display_content(vision_resp.content)
+                    msgs[-1] = msgs[-1].model_copy(
+                        update={"content": f"[Screen analysis]\n{vision_text}"}
+                    )
+                    if trace:
+                        trace.emit(
+                            "vision_completed",
+                            subagent_type=subagent_type,
+                            duration_ms=duration_ms(vision_start),
+                            content=vision_text,
+                            usage=getattr(vision_resp, "usage_metadata", None) or {},
+                        )
+                except Exception as exc:
+                    logger.warning("Subagent '%s' vision call failed: %s", subagent_type, exc)
+                    if trace:
+                        trace.emit(
+                            "vision_failed",
+                            subagent_type=subagent_type,
+                            duration_ms=duration_ms(vision_start),
+                            error_type=type(exc).__name__,
+                            error=str(exc),
+                        )
+            # ── end vision block ──
+
             llm_call = state.get("llm_calls_made", 0) + 1
 
             start = time.perf_counter()
@@ -193,6 +236,7 @@ class SubAgentManager:
         description: str,
         context: str = "",
         trace: TraceCollector | None = None,
+        session_id: str = "",
     ) -> SubAgentResult:
         config = self._configs.get(subagent_type)
         if config is None:
@@ -231,6 +275,7 @@ class SubAgentManager:
         }
 
         start = time.perf_counter()
+        clear_screenshots()
         if trace:
             trace.emit(
                 "subagent_started",
@@ -240,7 +285,11 @@ class SubAgentManager:
 
         try:
             with activate_trace(trace):
-                result = await graph.ainvoke(state)
+                if session_id:
+                    with activate_session(session_id):
+                        result = await graph.ainvoke(state)
+                else:
+                    result = await graph.ainvoke(state)
         except Exception as exc:
             logger.exception("Subagent '%s' crashed", subagent_type)
             if trace:
