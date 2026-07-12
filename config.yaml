@@ -59,13 +59,13 @@ computer_control:
 agent:
   persona_path: ${PERSONA_PATH}
   temperature: 0.3
-  max_iterations: 25
-  max_seconds: 120
+  max_iterations: 50
+  max_seconds: 300
 
 subagents:
   enabled: true
-  default_max_iterations: 10
-  default_max_seconds: 60
+  default_max_iterations: 20
+  default_max_seconds: 120
   agents:
     filesystem:
       description: "File operations: read, write, edit, create directories, move, search (glob/grep), file info, directory tree. Use for any file-related task."
@@ -87,8 +87,8 @@ subagents:
 
         Report: what files you touched, what changed, and whether the operation succeeded.
       tools: [mcp]
-      max_iterations: 10
-      max_seconds: 60
+      max_iterations: 20
+      max_seconds: 120
     coding:
       description: "Software engineering: write new code, edit existing code, debug errors, verify fixes. Use for any coding, debugging, or code-review task."
       system_prompt: |
@@ -110,8 +110,8 @@ subagents:
         Report: what files you changed, what the change was, and whether it is correct.
         Keep your response concise — no explanations of what you did not change.
       tools: [mcp]
-      max_iterations: 20
-      max_seconds: 180
+      max_iterations: 40
+      max_seconds: 300
     git:
       description: "Git operations: clone repos, stage, commit, push, pull, check status, view diffs, manage branches. Use for any git-related task."
       system_prompt: |
@@ -132,8 +132,8 @@ subagents:
 
         Report: what git operations you performed, their results, and the final repo state.
       tools: [mcp]
-      max_iterations: 10
-      max_seconds: 60
+      max_iterations: 20
+      max_seconds: 120
     browser:
       description: "Browser/web navigation: open browsers, navigate to URLs, interact with web pages (click links, fill forms, scroll), take screenshots. Use for web-based tasks."
       system_prompt: |
@@ -156,8 +156,8 @@ subagents:
         - Report: what browser you opened, what URL you navigated to, what you see on screen, and whether the task succeeded
         - If a step fails, diagnose with a screenshot and try an alternative approach
       tools: [computer]
-      max_iterations: 15
-      max_seconds: 120
+      max_iterations: 25
+      max_seconds: 180
     computer_control:
       description: "Desktop control: move mouse, click, type text, press keys, hotkeys, scroll, drag, take screenshots, launch or switch apps. Use for precise desktop/GUI manipulation."
       system_prompt: |
@@ -179,8 +179,8 @@ subagents:
         - If an action fails: screenshot, diagnose, try an alternative approach
         - Report: what actions you took, their results, and whether the task succeeded
       tools: [computer]
-      max_iterations: 15
-      max_seconds: 120
+      max_iterations: 25
+      max_seconds: 180
     general:
       description: "General-purpose agent with access to all tools. Use as a fallback when no specialized subagent fits the task."
       system_prompt: |
@@ -198,5 +198,5 @@ subagents:
         - Handle errors by diagnosing with available tools and trying alternatives
         - Keep your response focused on what was done and whether it succeeded
       tools: [mcp, computer]
-      max_iterations: 15
-      max_seconds: 120
+      max_iterations: 25
+      max_seconds: 180

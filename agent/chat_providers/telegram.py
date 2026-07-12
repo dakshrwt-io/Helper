@@ -13,7 +13,7 @@ from telegram.error import RetryAfter, TimedOut, NetworkError
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 from telegram.helpers import escape_markdown
 
-from agent.shared import get_graph, get_chat_lock, get_chat_bus
+from agent.shared import get_graph, get_chat_lock, get_chat_bus, get_cancel_event, request_cancel
 from agent.tools.computer import grant_desktop_lease, revoke_desktop_lease
 
 logger = logging.getLogger("agent.telegram")
@@ -226,6 +226,15 @@ async def desktop_off_cmd(update: Update, _context: Any) -> None:
     await _send_safe(update, "Desktop control disabled\\.")
 
 
+async def stop_cmd(update: Update, _context: Any) -> None:
+    authorized, _ = _check_access(update)
+    if not authorized or not update.effective_chat:
+        return
+    session_id = _context.user_data.get("session_id") or f"telegram_{update.effective_chat.id}"
+    request_cancel(session_id)
+    await _send_safe(update, "Cancelling current task\\.\\.\\.")
+
+
 # ── message handler ───────────────────────────────────────────────
 
 
@@ -272,7 +281,7 @@ async def message_handler(update: Update, _context: Any) -> None:
 
         async def _locked_chat() -> dict:
             async with get_chat_lock(session_id):
-                return await graph.chat(user_text, session_id=session_id, trace_queue=trace_queue)
+                return await graph.chat(user_text, session_id=session_id, trace_queue=trace_queue, cancel_event=get_cancel_event(session_id))
 
         try:
             await update.effective_chat.send_chat_action("typing")
@@ -336,6 +345,7 @@ def build_bot(token: str) -> Application:
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("reset", reset_cmd))
+    app.add_handler(CommandHandler("stop", stop_cmd))
     app.add_handler(CommandHandler("desktop_on", desktop_on_cmd))
     app.add_handler(CommandHandler("desktop_off", desktop_off_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))

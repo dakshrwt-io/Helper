@@ -36,7 +36,7 @@ async def test_chat_bus_only_delivers_matching_session() -> None:
     await bus.subscribe("b", receive_b)
     await bus.publish("a", {"type": "answer"})
 
-    assert received_a == [{"type": "answer"}]
+    assert received_a == [{"type": "answer", "session_id": "a"}]
     assert received_b == []
 
 
@@ -83,7 +83,7 @@ def test_websocket_requires_auth_and_owns_session_id(monkeypatch) -> None:
         def __init__(self) -> None:
             self.session_id = ""
 
-        async def chat(self, _text, session_id, trace_queue):
+        async def chat(self, _text, session_id, trace_queue, cancel_event=None):
             self.session_id = session_id
             return {"text": "ok"}
 

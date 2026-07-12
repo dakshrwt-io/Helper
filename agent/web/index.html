@@ -71,6 +71,7 @@
 <header>
   <h1>Personal AI Agent</h1>
   <div id="controls">
+    <button id="stop" type="button" style="display:none; background:#8b2020; color:#ff9f9f; border:0; padding:6px 10px; border-radius:6px; cursor:pointer;">Stop</button>
     <button id="desktop" type="button">Desktop: off</button>
     <button id="logout" type="button">Logout</button>
     <div id="status">connecting...</div>
@@ -97,6 +98,7 @@ const sendBtn = document.getElementById('send');
 const status = document.getElementById('status');
 const loginView = document.getElementById('login');
 const desktopBtn = document.getElementById('desktop');
+const stopBtn = document.getElementById('stop');
 let ws;
 let busy = false;
 let activeTrace = null;
@@ -108,7 +110,7 @@ let reconnectCountdownId = null;
 let pendingMessages = [];
 let maxReconnectAttempts = 10;
 
-function setBusy(b) { busy = b; sendBtn.disabled = b; input.disabled = b; if (!b) input.focus(); }
+function setBusy(b) { busy = b; sendBtn.disabled = b; input.disabled = b; stopBtn.style.display = b ? 'inline' : 'none'; if (!b) input.focus(); }
 
 function clearTrace() { activeTrace = null; activeToolPanel = null; pendingToolCard = null; }
 
@@ -319,6 +321,7 @@ function handleMessage(e) {
     data.messages.forEach(m => addMsg(m.role === 'user' ? 'user' : 'assistant', m.content));
     scrollToBottom();
   } else if (data.type === 'remote_user') {
+    clearTrace();
     addMsg('user', data.text);
     if (data.source) {
       const el = msgs.lastElementChild;
@@ -347,6 +350,10 @@ function handleMessage(e) {
   } else if (data.type === 'error') {
     msgs.querySelectorAll('.msg.thinking').forEach(t => t.remove());
     addMsg('error', data.text);
+    setBusy(false);
+  } else if (data.type === 'cancelled') {
+    msgs.querySelectorAll('.msg.thinking').forEach(t => t.remove());
+    addMsg('error', 'Task cancelled.');
     setBusy(false);
   }
 }
@@ -412,6 +419,10 @@ function send() {
 
 sendBtn.onclick = send;
 input.onkeydown = (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } };
+stopBtn.onclick = function () {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({type: 'cancel'}));
+};
 desktopBtn.onclick = function () {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   ws.send(JSON.stringify({

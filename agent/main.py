@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 
-from agent.shared import get_graph, get_chat_lock, get_chat_bus
+from agent.shared import get_graph, get_chat_lock, get_chat_bus, get_cancel_event, request_cancel
 from agent.tools.computer import grant_desktop_lease, revoke_desktop_lease
 
 load_dotenv()
@@ -161,18 +161,25 @@ async def health():
     return JSONResponse({"status": "ok"})
 
 
-async def _run_chat_with_trace(ws: WebSocket, user_text: str, session_id: str) -> dict:
+async def _run_chat_with_trace(ws: WebSocket, user_text: str, session_id: str, cancel_event: asyncio.Event | None = None) -> dict:
     """Run a turn while forwarding its internal execution events to the client."""
     graph = get_graph()
     trace_queue: asyncio.Queue[dict] = asyncio.Queue()
 
     async def _locked_chat():
         async with get_chat_lock(session_id):
-            return await graph.chat(user_text, session_id=session_id, trace_queue=trace_queue)
+            return await graph.chat(user_text, session_id=session_id, trace_queue=trace_queue, cancel_event=cancel_event)
 
     chat_task = asyncio.create_task(_locked_chat())
     event_task: asyncio.Task | None = asyncio.create_task(trace_queue.get())
     deadline = asyncio.get_running_loop().time() + 180
+
+    # Watch cancel event and cancel chat_task when fired
+    cancel_watch: asyncio.Task | None = None
+    if cancel_event:
+        async def _watch_cancel():
+            await cancel_event.wait()
+        cancel_watch = asyncio.create_task(_watch_cancel())
 
     try:
         while True:
@@ -182,6 +189,8 @@ async def _run_chat_with_trace(ws: WebSocket, user_text: str, session_id: str) -
             waiting = {chat_task}
             if event_task is not None:
                 waiting.add(event_task)
+            if cancel_watch is not None:
+                waiting.add(cancel_watch)
             done, _ = await asyncio.wait(
                 waiting,
                 timeout=remaining,
@@ -189,6 +198,16 @@ async def _run_chat_with_trace(ws: WebSocket, user_text: str, session_id: str) -
             )
             if not done:
                 raise asyncio.TimeoutError
+
+            if cancel_watch is not None and cancel_watch in done:
+                chat_task.cancel()
+                # Drain remaining trace events so client gets clean state
+                while not trace_queue.empty():
+                    try:
+                        await ws.send_json({"type": "trace", "event": trace_queue.get_nowait()})
+                    except Exception:
+                        break
+                raise asyncio.CancelledError("cancel requested")
 
             if event_task is not None and event_task in done:
                 await ws.send_json({"type": "trace", "event": event_task.result()})
@@ -202,6 +221,8 @@ async def _run_chat_with_trace(ws: WebSocket, user_text: str, session_id: str) -
             if event_task is None:
                 event_task = asyncio.create_task(trace_queue.get())
     finally:
+        if cancel_watch is not None and not cancel_watch.done():
+            cancel_watch.cancel()
         if event_task is not None and not event_task.done():
             event_task.cancel()
         if not chat_task.done():
@@ -226,6 +247,7 @@ async def chat_ws(ws: WebSocket):
         await bus_queue.put(event)
 
     sub_id = await bus.subscribe(session_id, _relay)
+    global_sub_id = await bus.subscribe_all(_relay)
 
     async def _forwarder() -> None:
         while True:
@@ -262,6 +284,11 @@ async def chat_ws(ws: WebSocket):
                     async with ws_lock:
                         await ws.send_json(payload)
                     continue
+                if data.get("type") == "cancel":
+                    request_cancel(session_id)
+                    async with ws_lock:
+                        await ws.send_json({"type": "cancelled"})
+                    continue
                 user_text = data.get("text", "").strip()
             except json.JSONDecodeError:
                 user_text = raw.strip()
@@ -289,10 +316,42 @@ async def chat_ws(ws: WebSocket):
             async with ws_lock:
                 await ws.send_json({"type": "thinking"})
 
+            # Run chat as a task so we can race it against incoming WS messages.
+            # Only one coroutine reads ws.receive_text() at a time: the outer
+            # loop reads when idle; this inner loop reads while chat runs.
+            cancel_event = get_cancel_event(session_id)
+            chat_task = asyncio.create_task(
+                _run_chat_with_trace(ws, user_text, session_id, cancel_event)
+            )
+
             try:
-                result = await _run_chat_with_trace(ws, user_text, session_id)
+                while not chat_task.done():
+                    recv_task = asyncio.create_task(ws.receive_text())
+                    done, _ = await asyncio.wait(
+                        {chat_task, recv_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if recv_task in done:
+                        try:
+                            raw_inner = recv_task.result()
+                            data = json.loads(raw_inner)
+                            if data.get("type") == "cancel":
+                                request_cancel(session_id)
+                                chat_task.cancel()
+                                async with ws_lock:
+                                    await ws.send_json({"type": "cancelled"})
+                            # Non-cancel messages during chat are consumed and ignored.
+                            # The UI should be disabled while busy.
+                        except Exception:
+                            pass
+                    else:
+                        recv_task.cancel()
+
+                result = await chat_task
                 async with ws_lock:
                     await ws.send_json(_answer_payload(result, graph))
+            except asyncio.CancelledError:
+                pass  # cancel already sent via cancelled message above
             except asyncio.TimeoutError:
                 async with ws_lock:
                     await ws.send_json({"type": "error", "text": "Agent timed out (180s)"})
@@ -300,11 +359,19 @@ async def chat_ws(ws: WebSocket):
                 logger.exception("chat error")
                 async with ws_lock:
                     await ws.send_json({"type": "error", "text": f"Error: {e}"})
+            finally:
+                if not chat_task.done():
+                    chat_task.cancel()
+                    try:
+                        await chat_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
     except WebSocketDisconnect:
         logger.info("WS disconnected")
     finally:
         revoke_desktop_lease(session_id)
         await bus.unsubscribe(sub_id)
+        await bus.unsubscribe(global_sub_id)
         fwd_task.cancel()
         try:
             await fwd_task

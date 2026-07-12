@@ -107,7 +107,7 @@ class TestBuildBot:
     def test_all_handlers_registered(self):
         app = build_bot("123:abc")
         total = sum(len(g) for g in app.handlers.values())
-        assert total == 6
+        assert total == 7
 
     def test_start_handler_exists(self):
         app = build_bot("123:abc")

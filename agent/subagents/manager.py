@@ -188,6 +188,12 @@ class SubAgentManager:
                 )
             try:
                 resp = await bound_llm.ainvoke(msgs)
+                cancel = state.get("cancel_event")
+                if cancel and cancel.is_set():
+                    return {
+                        "messages": state.get("messages", []),
+                        "stopped_reason": "cancelled",
+                    }
             except Exception as exc:
                 if trace:
                     trace.emit(

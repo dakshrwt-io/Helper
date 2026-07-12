@@ -39,7 +39,8 @@ class AgentState(TypedDict, total=False):
     llm_calls_made: int
     trace: TraceCollector
     started_at: float
-    stopped_reason: str  # "max_iterations" | "max_seconds" | ""
+    stopped_reason: str  # "max_iterations" | "max_seconds" | "cancelled" | ""
+    cancel_event: Any  # asyncio.Event — cooperative cancellation token
 
 
 class AgentGraph:
@@ -204,6 +205,12 @@ class AgentGraph:
         max_secs = float(self._cfg.get("agent", {}).get("max_seconds", 120))
 
         async def agent_node(state: AgentState) -> dict[str, Any]:
+            cancel = state.get("cancel_event")
+            if cancel and cancel.is_set():
+                return {
+                    "messages": state.get("messages", []),
+                    "stopped_reason": "cancelled",
+                }
             msgs = list(state.get("messages", []))
             if not msgs or not isinstance(msgs[0], SystemMessage):
                 current_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -262,6 +269,12 @@ class AgentGraph:
                 )
             try:
                 resp = await self._llm_with_tools.ainvoke(msgs)
+                cancel = state.get("cancel_event")
+                if cancel and cancel.is_set():
+                    return {
+                        "messages": state.get("messages", []),
+                        "stopped_reason": "cancelled",
+                    }
             except Exception as exc:
                 if trace:
                     trace.emit(
@@ -306,6 +319,9 @@ class AgentGraph:
             return result
 
         async def tools_node(state: AgentState) -> dict[str, Any]:
+            cancel = state.get("cancel_event")
+            if cancel and cancel.is_set():
+                return {"messages": state.get("messages", [])}
             if self._tools_node is None:
                 return {}
             with activate_trace(state.get("trace")):
@@ -315,6 +331,8 @@ class AgentGraph:
             return {"messages": msgs, "tool_calls_made": state.get("tool_calls_made", 0) + 1}
 
         def route(state: AgentState) -> str:
+            if state.get("stopped_reason") == "cancelled":
+                return END
             if state.get("tool_calls_made", 0) >= max_iter:
                 return END
             if max_secs > 0 and state.get("started_at"):
@@ -518,7 +536,7 @@ class AgentGraph:
                         tools_used.append(name)
                 unique_tools = list(dict.fromkeys(tools_used))  # dedup, preserve order
                 tool_list = ", ".join(unique_tools[:8]) if unique_tools else "none"
-                reason = {"max_iterations": "iteration limit", "max_seconds": "time limit"}.get(
+                reason = {"max_iterations": "iteration limit", "max_seconds": "time limit", "cancelled": "user request"}.get(
                     stopped_reason, stopped_reason
                 )
                 final = (
@@ -580,55 +598,62 @@ class AgentGraph:
         user_text: str,
         session_id: str = "default",
         trace_queue: asyncio.Queue[dict[str, Any]] | None = None,
+        cancel_event: asyncio.Event | None = None,
     ) -> dict[str, Any]:
         """Run one turn and emit its LLM and tool execution trace."""
+        from agent.shared import clear_cancel
+
         trace = TraceCollector(queue=trace_queue)
         turn_start = time.perf_counter()
 
-        with activate_session(session_id), activate_trace(trace):
-            trace.emit("turn_started", session_id=session_id)
-            clear_screenshots()
-            try:
-                prior, summary = await self._load_history_messages(session_id, trace)
-                # Compute turn hashes from prior to deduplicate vector recall
-                prior_hashes: set[str] = set()
-                for i in range(0, len(prior) - 1, 2):
-                    if isinstance(prior[i], HumanMessage) and isinstance(prior[i + 1], AIMessage):
-                        prior_hashes.add(str(hash(str(prior[i].content) + "|" + str(prior[i + 1].content))))
-                recalled = await self._recall_context(user_text, session_id, trace, prior_hashes)
-                msgs = self._build_turn_messages(user_text, recalled, prior, summary)
-                state: AgentState = {
-                    "messages": msgs,
-                    "session_id": session_id,
-                    "tool_calls_made": 0,
-                    "llm_calls_made": 0,
-                    "trace": trace,
-                    "started_at": time.perf_counter(),
-                }
-                result = await self._graph.ainvoke(state)
-                out_msgs = result.get("messages", [])
-                final = self._extract_final_text(out_msgs, result.get("stopped_reason", ""))
+        try:
+            with activate_session(session_id), activate_trace(trace):
+                trace.emit("turn_started", session_id=session_id)
+                clear_screenshots()
+                try:
+                    prior, summary = await self._load_history_messages(session_id, trace)
+                    # Compute turn hashes from prior to deduplicate vector recall
+                    prior_hashes: set[str] = set()
+                    for i in range(0, len(prior) - 1, 2):
+                        if isinstance(prior[i], HumanMessage) and isinstance(prior[i + 1], AIMessage):
+                            prior_hashes.add(str(hash(str(prior[i].content) + "|" + str(prior[i + 1].content))))
+                    recalled = await self._recall_context(user_text, session_id, trace, prior_hashes)
+                    msgs = self._build_turn_messages(user_text, recalled, prior, summary)
+                    state: AgentState = {
+                        "messages": msgs,
+                        "session_id": session_id,
+                        "tool_calls_made": 0,
+                        "llm_calls_made": 0,
+                        "trace": trace,
+                        "started_at": time.perf_counter(),
+                        "cancel_event": cancel_event,
+                    }
+                    result = await self._graph.ainvoke(state)
+                    out_msgs = result.get("messages", [])
+                    final = self._extract_final_text(out_msgs, result.get("stopped_reason", ""))
 
-                await self._persist_turn(session_id, user_text, final, trace)
-                trace.emit(
-                    "turn_completed",
-                    duration_ms=duration_ms(turn_start),
-                    llm_calls=result.get("llm_calls_made", 0),
-                    tool_rounds=result.get("tool_calls_made", 0),
-                )
-                return {
-                    "text": final,
-                    "messages": out_msgs,
-                    "trace": trace.events,
-                }
-            except Exception as exc:
-                trace.emit(
-                    "turn_failed",
-                    duration_ms=duration_ms(turn_start),
-                    error_type=type(exc).__name__,
-                    error=str(exc),
-                )
-                raise
+                    await self._persist_turn(session_id, user_text, final, trace)
+                    trace.emit(
+                        "turn_completed",
+                        duration_ms=duration_ms(turn_start),
+                        llm_calls=result.get("llm_calls_made", 0),
+                        tool_rounds=result.get("tool_calls_made", 0),
+                    )
+                    return {
+                        "text": final,
+                        "messages": out_msgs,
+                        "trace": trace.events,
+                    }
+                except Exception as exc:
+                    trace.emit(
+                        "turn_failed",
+                        duration_ms=duration_ms(turn_start),
+                        error_type=type(exc).__name__,
+                        error=str(exc),
+                    )
+                    raise
+        finally:
+            clear_cancel(session_id)
 
     async def close(self) -> None:
         await self.mcp.stop()

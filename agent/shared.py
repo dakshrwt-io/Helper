@@ -15,6 +15,23 @@ if TYPE_CHECKING:
 from agent.chat_bus import ChatBus
 
 _STRIP_ADDITIONAL_KW = frozenset({"reasoning_content", "reasoning_details"})
+_cancel_events: dict[str, asyncio.Event] = {}
+
+def get_cancel_event(session_id: str) -> asyncio.Event:
+    """Return (or create) the cancellation token for a session."""
+    if session_id not in _cancel_events:
+        _cancel_events[session_id] = asyncio.Event()
+    return _cancel_events[session_id]
+
+def request_cancel(session_id: str) -> None:
+    """Signal cancellation for an active agent turn."""
+    event = _cancel_events.get(session_id)
+    if event:
+        event.set()
+
+def clear_cancel(session_id: str) -> None:
+    """Remove stale cancellation token after a turn completes."""
+    _cancel_events.pop(session_id, None)
 
 
 def sanitize_aimessage(m: AIMessage) -> AIMessage:
