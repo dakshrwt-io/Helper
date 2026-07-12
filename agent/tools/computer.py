@@ -14,6 +14,7 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.tools import StructuredTool
+from PIL import Image
 from pydantic import BaseModel, Field
 
 from agent.shared import get_active_session_id, sanitize_aimessage
@@ -35,6 +36,41 @@ def _ensure_pyautogui() -> None:
         raise RuntimeError(
             "PyAutoGUI is not available. Install with: pip install PyAutoGUI Pillow"
         )
+
+
+def _annotate_screenshot(img: Image.Image) -> Image.Image:
+    """Overlay coordinate grid with axis labels for visual grounding.
+
+    Gridlines every 100px with red axis labels at (x, 0) and (0, y).
+    Best-effort — silently returns original image on any error.
+    """
+    try:
+        from PIL import ImageDraw, ImageFont
+
+        if img.mode != "RGBA":
+            img = img.convert("RGBA")
+        w, h = img.size
+
+        overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
+        font = ImageFont.load_default()
+
+        grid_color = (255, 60, 60, 50)  # semi-transparent red
+        for x in range(0, w, 100):
+            draw.line([(x, 0), (x, h)], fill=grid_color, width=1)
+        for y in range(0, h, 100):
+            draw.line([(0, y), (w, y)], fill=grid_color, width=1)
+
+        label_color = (255, 60, 60, 180)
+        for x in range(0, w, 100):
+            draw.text((x + 2, 2), str(x), fill=label_color, font=font)
+        for y in range(100, h, 100):
+            draw.text((2, y + 2), str(y), fill=label_color, font=font)
+
+        img = Image.alpha_composite(img, overlay)
+        return img.convert("RGB")
+    except Exception:
+        return img
 
 
 # ── Screenshot storage (FIFO) for multimodal injection into LLM ─────
@@ -109,17 +145,52 @@ def _authorize_action(tool_name: str) -> None:
     actions.append(now)
 
 
-def inject_screenshots(messages: list[Any]) -> list[Any]:
-    """Wrap ``computer_screenshot`` ToolMessages with a follow-up HumanMessage
-    carrying the image, as Groq and some vision APIs reject images in ToolMessages.
+def strip_image_content(messages: list[Any]) -> list[Any]:
+    """Remove all image_url content blocks from messages.
+
+    After vision LLM processes screenshots, the acting LLM may be text-only
+    and reject image_url blocks. This strips them while preserving text.
     """
     result: list[Any] = []
+    for m in messages:
+        content = getattr(m, "content", "")
+        if isinstance(content, list):
+            # Keep only text blocks; drop image_url blocks
+            text_parts = [
+                block for block in content
+                if isinstance(block, dict) and block.get("type") != "image_url"
+            ]
+            if text_parts:
+                # Rebuild message with text-only content
+                new_content = text_parts if len(text_parts) > 1 else text_parts[0].get("text", "")
+                try:
+                    result.append(m.__class__(content=new_content))
+                except Exception:
+                    result.append(m)
+            else:
+                # All content was images — drop the message entirely
+                pass
+        else:
+            result.append(m)
+    return result
+
+
+def inject_screenshots(messages: list[Any]) -> list[Any]:
+    """Insert HumanMessage(image_url) after each computer_screenshot ToolMessage.
+
+    Non-destructive — reads screenshot buffer without consuming it.
+    Use clear_screenshots() to reset the buffer between turns.
+    """
+    result: list[Any] = []
+    screenshots = list(_screenshot_buffer())  # copy, don't consume
+    ss_idx = 0
     for m in messages:
         clean = sanitize_aimessage(m) if isinstance(m, AIMessage) else m
         result.append(clean)
         if isinstance(m, ToolMessage) and getattr(m, "name", None) == "computer_screenshot":
-            b64 = _pop_screenshot()
-            if b64:
+            if ss_idx < len(screenshots):
+                b64 = screenshots[ss_idx]
+                ss_idx += 1
                 result.append(
                     HumanMessage(
                         content=[
@@ -242,11 +313,16 @@ class _RightClickArgs(BaseModel):
 async def _exec_screenshot(**kwargs: Any) -> str:
     _ensure_pyautogui()
     img = await asyncio.to_thread(pyautogui.screenshot)
+    img = _annotate_screenshot(img)
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=True)
     b64 = base64.b64encode(buf.getvalue()).decode()
     _push_screenshot(b64)
-    return f"Screenshot captured ({img.width}\u00d7{img.height}). Describe what you see."
+    return (
+        f"Screenshot captured ({img.width}\u00d7{img.height}) with coordinate grid. "
+        f"Gridlines every 100px. Red labels at edges show (x,y) coordinates. "
+        f"Use grid labels to estimate click targets precisely."
+    )
 
 
 async def _exec_get_screen_size(**kwargs: Any) -> str:

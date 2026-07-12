@@ -35,3 +35,5 @@ class SubAgentResult:
     llm_calls: int
     success: bool
     error: str | None = None
+    completed: bool = True  # False when forced stop (max_iter/max_secs)
+    stopped_reason: str | None = None  # "max_iterations" | "max_seconds" | None

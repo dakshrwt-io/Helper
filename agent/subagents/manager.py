@@ -13,7 +13,7 @@ from typing_extensions import TypedDict
 from agent.shared import activate_session, sanitize_aimessage
 from agent.subagents.types import SubAgentConfig, SubAgentResult
 from agent.trace import TraceCollector, activate_trace, display_content, duration_ms
-from agent.tools.computer import clear_screenshots, inject_screenshots
+from agent.tools.computer import clear_screenshots, inject_screenshots, strip_image_content
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +24,7 @@ class SubAgentState(TypedDict, total=False):
     llm_calls_made: int
     trace: TraceCollector
     started_at: float
+    stopped_reason: str  # "max_iterations" | "max_seconds" | ""
 
 
 class SubAgentManager:
@@ -46,10 +47,14 @@ class SubAgentManager:
         self._vision_llm = vision_llm
         self._vision_model = vision_model
 
+        self._llm_cfg = raw_config.get("llm", {})
+        self._temperature = float(raw_config.get("agent", {}).get("temperature", 0.3))
+
         self._configs: dict[str, SubAgentConfig] = {}
         self._graphs: dict[str, Any] = {}
         self._bound_llms: dict[str, Any] = {}
         self._tool_nodes: dict[str, ToolNode] = {}
+        self._custom_llms: dict[str, Any] = {}  # cache: model_name → LLM instance
 
         self._parse_configs(raw_config)
         self._build_all_graphs()
@@ -90,8 +95,27 @@ class SubAgentManager:
             self._build_graph_for(config)
 
     def _build_graph_for(self, config: SubAgentConfig) -> None:
+        from agent.llm_factory import build_llm
+
         tools = self._get_tools_for(config)
-        bound_llm = self._llm.bind_tools(tools) if tools else self._llm
+
+        # Per-subagent model override: build dedicated LLM if config.model is set
+        if config.model and config.model != self._model_name:
+            if config.model not in self._custom_llms:
+                custom_llm, _ = build_llm(
+                    llm_cfg=self._llm_cfg,
+                    backend=self._llm_backend,
+                    model_name=config.model,
+                    temperature=self._temperature,
+                )
+                self._custom_llms[config.model] = custom_llm
+            effective_llm = self._custom_llms[config.model]
+            effective_model_name = config.model
+        else:
+            effective_llm = self._llm
+            effective_model_name = self._model_name
+
+        bound_llm = effective_llm.bind_tools(tools) if tools else effective_llm
         self._bound_llms[config.name] = bound_llm
         self._tool_nodes[config.name] = ToolNode(tools) if tools else None
 
@@ -107,8 +131,10 @@ class SubAgentManager:
 
             trace = state.get("trace")
 
-            # ── Vision: analyse screenshot if last message is one ──
+            # ── Vision: inject screenshot images for vision model; strip before acting model ──
             if self._vision_llm is not None and msgs and isinstance(msgs[-1], ToolMessage) and getattr(msgs[-1], "name", None) == "computer_screenshot":
+                # Inject screenshot image into message list so vision model sees pixels
+                msgs = inject_screenshots(msgs)
                 vision_start = time.perf_counter()
                 if trace:
                     trace.emit(
@@ -118,12 +144,14 @@ class SubAgentManager:
                         backend="vision",
                     )
                 try:
-                    vision_msgs = inject_screenshots(msgs)
-                    vision_resp = await self._vision_llm.ainvoke(vision_msgs)
+                    vision_resp = await self._vision_llm.ainvoke(msgs)
                     vision_text = display_content(vision_resp.content)
-                    msgs[-1] = msgs[-1].model_copy(
-                        update={"content": f"[Screen analysis]\n{vision_text}"}
+                    # Append vision description as additional context
+                    msgs.append(
+                        HumanMessage(content=f"[Screen analysis]\n{vision_text}")
                     )
+                    # Strip image blocks so text-only acting model does not reject them
+                    msgs = strip_image_content(msgs)
                     if trace:
                         trace.emit(
                             "vision_completed",
@@ -134,6 +162,8 @@ class SubAgentManager:
                         )
                 except Exception as exc:
                     logger.warning("Subagent '%s' vision call failed: %s", subagent_type, exc)
+                    # Strip images even on failure so acting model can proceed
+                    msgs = strip_image_content(msgs)
                     if trace:
                         trace.emit(
                             "vision_failed",
@@ -152,7 +182,7 @@ class SubAgentManager:
                     "subagent_llm_started",
                     subagent_type=subagent_type,
                     llm_call=llm_call,
-                    model=self._model_name,
+                    model=effective_model_name,
                     backend=self._llm_backend,
                     message_count=len(msgs),
                 )
@@ -188,11 +218,24 @@ class SubAgentManager:
                     usage=usage or {},
                 )
 
-            return {
+            # Detect forced stop: LLM wants more tool calls but limits prevent next iteration
+            tc = state.get("tool_calls_made", 0)
+            has_tool_calls = bool(getattr(resp, "tool_calls", None))
+            stopped_reason = ""
+            if has_tool_calls:
+                if tc + 1 >= max_iter:
+                    stopped_reason = "max_iterations"
+                elif max_secs > 0 and state.get("started_at"):
+                    if time.perf_counter() - state["started_at"] >= max_secs:
+                        stopped_reason = "max_seconds"
+            result: dict[str, Any] = {
                 "messages": msgs + [resp],
-                "tool_calls_made": state.get("tool_calls_made", 0),
+                "tool_calls_made": tc,
                 "llm_calls_made": llm_call,
             }
+            if stopped_reason:
+                result["stopped_reason"] = stopped_reason
+            return result
 
         async def tools_node(state: SubAgentState) -> dict[str, Any]:
             tool_node = self._tool_nodes[config.name]
@@ -322,9 +365,16 @@ class SubAgentManager:
                     break
         if not final:
             final = "Subagent completed but produced no text output."
+        elif final.startswith("[Thinking]"):
+            logger.warning(
+                "Reasoning content leaked into subagent final answer — "
+                "this indicates a bug in reasoning-content handling"
+            )
 
         iterations = result.get("tool_calls_made", 0)
         llm_calls = result.get("llm_calls_made", 0)
+        stopped_reason = result.get("stopped_reason", "")
+        completed = not bool(stopped_reason)
         success = True
 
         if trace:
@@ -335,6 +385,8 @@ class SubAgentManager:
                 iterations=iterations,
                 llm_calls=llm_calls,
                 output_preview=final[:200],
+                completed=completed,
+                stopped_reason=stopped_reason or None,
             )
 
         return SubAgentResult(
@@ -343,4 +395,6 @@ class SubAgentManager:
             iterations=iterations,
             llm_calls=llm_calls,
             success=success,
+            completed=completed,
+            stopped_reason=stopped_reason or None,
         )

@@ -68,12 +68,15 @@ def build_task_tool(manager: SubAgentManager, chatdb: Any = None) -> StructuredT
         output: dict[str, Any] = {
             "subagent_type": result.subagent_type,
             "success": result.success,
+            "completed": result.completed,
             "iterations": result.iterations,
             "llm_calls": result.llm_calls,
             "output": result.output,
         }
         if result.error:
             output["error"] = result.error
+        if result.stopped_reason:
+            output["stopped_reason"] = result.stopped_reason
 
         if trace:
             trace.emit(

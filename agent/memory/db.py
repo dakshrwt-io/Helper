@@ -62,13 +62,15 @@ class ChatDB:
     def get_history(self, session_id: str, limit: int = 50) -> list[dict]:
         s = self.Session()
         try:
-            rows = s.scalars(
+            query = (
                 select(MessageRow)
                 .filter_by(session_id=session_id)
                 .order_by(MessageRow.id.desc())
-                .limit(limit)
-            ).all()
-            return [{"role": r.role, "content": r.content, "ts": str(r.ts)} for r in reversed(rows)]
+            )
+            if limit > 0:
+                query = query.limit(limit)
+            rows = s.scalars(query).all()
+            return [{"role": r.role, "content": r.content, "ts": str(r.ts), "id": r.id} for r in reversed(rows)]
         finally:
             s.close()
 
