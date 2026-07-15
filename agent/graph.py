@@ -126,6 +126,10 @@ class AgentGraph:
 
         vision_cfg = llm_cfg.get("vision", {})
         vision_key = vision_cfg.get("api_key", "")
+        # Fall back to groq config when vision section is unconfigured
+        if (not vision_key or vision_key in ("", "REPLACE_ME")) and llm_cfg.get("groq", {}).get("api_key", ""):
+            vision_cfg = llm_cfg.get("groq", {})
+            vision_key = vision_cfg.get("api_key", "")
         if vision_key and vision_key not in ("", "REPLACE_ME"):
             from langchain_openai import ChatOpenAI
 

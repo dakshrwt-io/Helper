@@ -3,8 +3,8 @@ module.exports = {
     {
       name: 'ai-agent',
       script: 'run_server.py',
-      interpreter: 'C:\\Projects\\.venv\\Scripts\\python.exe',
-      cwd: 'C:\\Projects\\Helper',
+      interpreter: 'C:\\helper-repo\\.venv\\Scripts\\python.exe',
+      cwd: 'C:\\helper-repo\\Helper',
       env: { PYTHONPATH: '.' },
       watch: false,
       autorestart: true,
