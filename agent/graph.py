@@ -227,6 +227,23 @@ class AgentGraph:
             if self._vision_llm is not None and msgs and isinstance(msgs[-1], ToolMessage) and getattr(msgs[-1], "name", None) == "computer_screenshot":
                 # Inject screenshot image into message list so vision model sees pixels
                 msgs = inject_screenshots(msgs)
+                # Minimal vision prompt: instruction + screenshot only (skip persona/history)
+                vision_msgs = [
+                    SystemMessage(content=(
+                        "You are a screen reader. Describe this screenshot in exact detail.\n"
+                        "Include:\n"
+                        "- Every visible window (title, position, content)\n"
+                        "- All UI elements (buttons, fields, menus, icons)\n"
+                        "- Any visible text (read it verbatim)\n"
+                        "- Mouse cursor position if visible\n"
+                        "- Coordinate grid labels (red numbers at edges)\n"
+                        "- Taskbar / system tray state\n"
+                        "\n"
+                        "Be specific and thorough. Your description will be used by another AI "
+                        "to decide what actions to take on this screen."
+                    )),
+                    msgs[-1],  # injected HumanMessage with image_url
+                ]
                 vision_start = time.perf_counter()
                 if trace:
                     trace.emit(
@@ -235,7 +252,7 @@ class AgentGraph:
                         backend="vision",
                     )
                 try:
-                    vision_resp = await self._vision_llm.ainvoke(msgs)
+                    vision_resp = await self._vision_llm.ainvoke(vision_msgs)
                     vision_text = display_content(vision_resp.content)
                     # Append vision description as additional context
                     msgs.append(

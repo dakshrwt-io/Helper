@@ -36,6 +36,16 @@ mcp:
       - "@modelcontextprotocol/server-filesystem"
       - "${FILESYSTEM_MCP_DIR}"
     transport: stdio
+  sarvam:
+    command: uvx
+    args:
+      - sarvam-mcp
+    env:
+      SARVAM_API_KEY: ${SARVAM_API_KEY}
+    tool_include:
+      - sarvam_tools_stt_
+      - sarvam_tools_tts_
+    
 
 memory:
   sqlite: ${DATA_DIR}/history.db

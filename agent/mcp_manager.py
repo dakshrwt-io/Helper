@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import random
+import sys
 import time
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
@@ -28,6 +30,8 @@ class MCPServerConfig:
     command: str
     args: list[str]
     transport: str = "stdio"
+    env: dict[str, str] | None = None
+    tool_include: list[str] | None = None
 
 
 class MCPManager:
@@ -79,6 +83,8 @@ class MCPManager:
                 command=cfg["command"],
                 args=cfg.get("args", []),
                 transport=cfg.get("transport", "stdio"),
+                env=cfg.get("env"),
+                tool_include=cfg.get("tool_include"),
             )
 
     async def start(self) -> None:
@@ -102,11 +108,25 @@ class MCPManager:
         srv = self._servers[name]
         stack = AsyncExitStack()
         try:
-            params = StdioServerParameters(command=srv.command, args=srv.args)
+            merged_env = dict(os.environ)
+            if srv.env:
+                merged_env.update(srv.env)
+            # Resolve command to venv Scripts if bare name (needed when PATH lacks venv dir)
+            cmd = srv.command
+            if os.sep not in cmd and os.altsep not in cmd:
+                venv_scripts = os.path.dirname(sys.executable)
+                for candidate in (os.path.join(venv_scripts, cmd),
+                                  os.path.join(venv_scripts, cmd + ".exe")):
+                    if os.path.isfile(candidate):
+                        cmd = candidate
+                        break
+            params = StdioServerParameters(command=cmd, args=srv.args, env=merged_env)
             read, write = await stack.enter_async_context(stdio_client(params))
             session = await stack.enter_async_context(ClientSession(read, write))
             await session.initialize()
             tools = (await session.list_tools()).tools
+            if srv.tool_include:
+                tools = [t for t in tools if any(t.name.startswith(p) for p in srv.tool_include)]
         except BaseException:
             await stack.aclose()
             raise
