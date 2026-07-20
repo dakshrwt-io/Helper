@@ -129,6 +129,38 @@ async def _send_safe(update: Update, text: str) -> None:
         await _send_with_retry(update, text, parse_mode=None)
 
 
+async def _send_access_denied(update: Update, tg_id: int | None) -> None:
+    """Send the standard response for an unauthorized Telegram user."""
+    await _send_safe(
+        update,
+        f"\U0001f512 *Access denied*\nYour Telegram user ID: `{tg_id or 'unknown'}`\n"
+        "Add it to TELEGRAM_ALLOWED_USERS in your \\.env file\\.",
+    )
+
+
+async def _stop_trace_bridge(bridge_task: asyncio.Task) -> None:
+    """Cancel the trace relay without surfacing its expected cancellation."""
+    bridge_task.cancel()
+    try:
+        await bridge_task
+    except asyncio.CancelledError:
+        pass
+
+
+async def _publish_queued_traces(
+    bus: Any,
+    session_id: str,
+    trace_queue: asyncio.Queue[dict],
+) -> None:
+    """Publish trace events produced before the relay was stopped."""
+    while not trace_queue.empty():
+        try:
+            event = trace_queue.get_nowait()
+            await bus.publish(session_id, {"type": "trace", "event": event})
+        except asyncio.QueueEmpty:
+            break
+
+
 async def _send_with_retry(
     update: Update,
     text: str,
@@ -161,7 +193,7 @@ async def start_cmd(update: Update, _context: Any) -> None:
         return
     authorized, tg_id = _check_access(update)
     if not authorized:
-        await _send_safe(update, f"\U0001f512 *Access denied*\nYour Telegram user ID: `{tg_id or 'unknown'}`\nAdd it to TELEGRAM_ALLOWED_USERS in your \\.env file\\.")
+        await _send_access_denied(update, tg_id)
         return
     graph = get_graph()
     tool_count = len(graph.mcp.tool_names) if graph and graph.mcp else 0
@@ -182,7 +214,7 @@ async def help_cmd(update: Update, _context: Any) -> None:
         return
     authorized, tg_id = _check_access(update)
     if not authorized:
-        await _send_safe(update, f"\U0001f512 *Access denied*\nYour Telegram user ID: `{tg_id or 'unknown'}`\nAdd it to TELEGRAM_ALLOWED_USERS in your \\.env file\\.")
+        await _send_access_denied(update, tg_id)
         return
     await _send_safe(
         update,
@@ -199,7 +231,7 @@ async def reset_cmd(update: Update, _context: Any) -> None:
         return
     authorized, tg_id = _check_access(update)
     if not authorized:
-        await _send_safe(update, f"\U0001f512 *Access denied*\nYour Telegram user ID: `{tg_id or 'unknown'}`\nAdd it to TELEGRAM_ALLOWED_USERS in your \\.env file\\.")
+        await _send_access_denied(update, tg_id)
         return
     old_session = _context.user_data.pop("session_id", None)
     if old_session:
@@ -244,7 +276,7 @@ async def message_handler(update: Update, _context: Any) -> None:
 
     authorized, tg_id = _check_access(update)
     if not authorized:
-        await _send_safe(update, f"\U0001f512 *Access denied*\nYour Telegram user ID: `{tg_id or 'unknown'}`\nAdd it to TELEGRAM_ALLOWED_USERS in your \\.env file\\.")
+        await _send_access_denied(update, tg_id)
         return
 
     graph = get_graph()
@@ -289,39 +321,18 @@ async def message_handler(update: Update, _context: Any) -> None:
             pass
         result = await asyncio.wait_for(_locked_chat(), timeout=180)
     except asyncio.TimeoutError:
-        bridge_task.cancel()
-        try:
-            await bridge_task
-        except asyncio.CancelledError:
-            pass
-        while not trace_queue.empty():
-            try:
-                await bus.publish(session_id, {"type": "trace", "event": trace_queue.get_nowait()})
-            except asyncio.QueueEmpty:
-                break
+        await _stop_trace_bridge(bridge_task)
+        await _publish_queued_traces(bus, session_id, trace_queue)
         await _send_safe(update, "The agent timed out \\(180s\\)\\. Please try a simpler request\\.")
         return
     except Exception as exc:
-        bridge_task.cancel()
-        try:
-            await bridge_task
-        except asyncio.CancelledError:
-            pass
+        await _stop_trace_bridge(bridge_task)
         logger.exception("Telegram handler error")
         await _send_safe(update, f"*Error*: {exc}")
         return
 
-    bridge_task.cancel()
-    try:
-        await bridge_task
-    except asyncio.CancelledError:
-        pass
-
-    while not trace_queue.empty():
-        try:
-            await bus.publish(session_id, {"type": "trace", "event": trace_queue.get_nowait()})
-        except asyncio.QueueEmpty:
-            break
+    await _stop_trace_bridge(bridge_task)
+    await _publish_queued_traces(bus, session_id, trace_queue)
 
     final_text = result.get("text", "").strip()
     if not final_text:

@@ -11,7 +11,17 @@ env/
 
 # Secrets / local
 .repoteach
-.env
+.env*
+!.env.example
+.envrc
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+credentials/
+config.local.yaml
+config.local.yml
 data/
 .agents/
 *.db
@@ -26,6 +36,7 @@ pm2_logs/
 # IDE
 .vscode/
 .idea/
+.vs/
 
 # Node
 node_modules/
@@ -33,6 +44,8 @@ node_modules/
 # Testing
 .pytest_cache/
 pytest-cache-files-*/
+.coverage
+htmlcov/
 
 # Playwright MCP snapshots
 .playwright-mcp/

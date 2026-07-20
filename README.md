@@ -374,7 +374,7 @@ subagents:
   agents: { filesystem, coding, git, browser, computer_control, general }
 ```
 
-Env vars (`${VAR}`) are expanded at load time. `MCPManager._expand` and `AgentGraph._load` both call `os.path.expandvars` recursively on the parsed YAML.
+Env vars (`${VAR}`) are expanded at load time by `agent.config_utils.expand_env_vars()` before MCP and agent configuration are used.
 
 ### `agent/persona.md`
 
@@ -590,7 +590,7 @@ The brain. Key parts:
 
 **`setup()` (async):** the only entrypoint to initialize everything.
 
-1. `_load()` — parse `config.yaml`, expand env vars, load `persona.md`, init `ChatDB` + `VectorStore`. If vector store is empty but SQLite has turns, rebuilds ChromaDB from SQLite.
+1. `load_agent_config()` — parse `config.yaml`, expand env vars, load `persona.md`, init `ChatDB` + `VectorStore`. If vector store is empty but SQLite has turns, rebuilds ChromaDB from SQLite.
 2. `mcp.start()` — spawn MCP servers + start health monitor.
 3. `_make_llm()` — build LLM client (5 backends, single env switch). Also builds the optional Groq vision LLM.
 4. `build_langchain_tools(mcp)` — wrap MCP tools as LangChain tools.

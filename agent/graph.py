@@ -3,28 +3,26 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import time
-import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-import yaml
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.graph import END, StateGraph
 from langgraph.prebuilt import ToolNode
 from typing_extensions import TypedDict
 
+from agent.agent_helpers import analyze_screenshot, extract_final_ai_text
+from agent.config_loader import load_agent_config
 from agent.mcp_adapter import build_langchain_tools
 from agent.mcp_manager import MCPManager
 from agent.memory.db import ChatDB
+from agent.memory_manager import MemoryManager
 from agent.memory.vector import VectorStore
 from agent.subagents import SubAgentManager, build_task_tool
 from agent.tools.computer import (
     clear_screenshots,
     get_computer_tools,
-    inject_screenshots,
-    strip_image_content,
 )
 from agent.shared import activate_session, sanitize_aimessage
 from agent.trace import TraceCollector, activate_trace, display_content, duration_ms
@@ -65,46 +63,7 @@ class AgentGraph:
         self._vision_model: str = ""
         self._subagent_manager: SubAgentManager | None = None
         self._max_history_tokens: int = 4000
-        self._summaries: dict[str, tuple[str, int]] = {}  # session_id → (summary_text, max_message_id)
-
-    def _load(self) -> None:
-        with open(self.config_path, "r", encoding="utf-8") as f:
-            raw = yaml.safe_load(f)
-
-        def _expand(obj: Any) -> Any:
-            if isinstance(obj, str):
-                return os.path.expandvars(obj)
-            if isinstance(obj, dict):
-                return {k: _expand(v) for k, v in obj.items()}
-            if isinstance(obj, list):
-                return [_expand(v) for v in obj]
-            return obj
-
-        self._cfg = _expand(raw)
-        ag = self._cfg.get("agent", {})
-        self._max_history_tokens = int(ag.get("max_history_tokens", 4000))
-        p = os.path.expandvars(ag.get("persona_path", "agent/persona.md"))
-        try:
-            with open(p, "r", encoding="utf-8") as f:
-                self._persona = f.read()
-        except OSError:
-            self._persona = "You are a helpful personal AI assistant."
-        mem = self._cfg.get("memory", {})
-        self._chatdb = ChatDB(os.path.expandvars(mem.get("sqlite", "data/history.db")))
-        self._vector = VectorStore(os.path.expandvars(mem.get("chroma", "data/chroma")))
-
-        if self._vector.count() == 0:
-            turns = self._chatdb.export_all_turns()
-            if turns:
-                logger.info(
-                    "Vector store is empty — rebuilding from %d SQLite turns",
-                    len(turns),
-                )
-                self._vector.rebuild(
-                    ids=[str(uuid.uuid4()) for _ in turns],
-                    texts=[t["text"] for t in turns],
-                    metas=[{"session_id": t["session_id"]} for t in turns],
-                )
+        self._memory_manager: MemoryManager | None = None
 
     def _make_llm(self) -> None:
         """Build the LLM based on the configured backend."""
@@ -148,7 +107,12 @@ class AgentGraph:
         """Async init: load config, start MCP, build LLM+tools+graph."""
         setup_start = time.perf_counter()
         phase_start = time.perf_counter()
-        self._load()
+        loaded_config = load_agent_config(self.config_path)
+        self._cfg = loaded_config.config
+        self._persona = loaded_config.persona
+        self._chatdb = loaded_config.chatdb
+        self._vector = loaded_config.vector
+        self._max_history_tokens = loaded_config.max_history_tokens
         logger.info("Agent setup load completed in %d ms", duration_ms(phase_start))
 
         phase_start = time.perf_counter()
@@ -158,6 +122,19 @@ class AgentGraph:
         phase_start = time.perf_counter()
         self._make_llm()
         logger.info("Agent setup LLM init completed in %d ms", duration_ms(phase_start))
+
+        if self._memory_manager is None:
+            self._memory_manager = MemoryManager(
+                self._chatdb,
+                self._vector,
+                self._llm,
+                self._max_history_tokens,
+            )
+        else:
+            self._memory_manager.chatdb = self._chatdb
+            self._memory_manager.vector = self._vector
+            self._memory_manager.llm = self._llm
+            self._memory_manager.max_history_tokens = self._max_history_tokens
 
         phase_start = time.perf_counter()
         tools = await build_langchain_tools(self.mcp)
@@ -225,59 +202,14 @@ class AgentGraph:
             llm_call = state.get("llm_calls_made", 0) + 1
 
             if self._vision_llm is not None and msgs and isinstance(msgs[-1], ToolMessage) and getattr(msgs[-1], "name", None) == "computer_screenshot":
-                # Inject screenshot image into message list so vision model sees pixels
-                msgs = inject_screenshots(msgs)
-                # Minimal vision prompt: instruction + screenshot only (skip persona/history)
-                vision_msgs = [
-                    SystemMessage(content=(
-                        "You are a screen reader. Describe this screenshot in exact detail.\n"
-                        "Include:\n"
-                        "- Every visible window (title, position, content)\n"
-                        "- All UI elements (buttons, fields, menus, icons)\n"
-                        "- Any visible text (read it verbatim)\n"
-                        "- Mouse cursor position if visible\n"
-                        "- Coordinate grid labels (red numbers at edges)\n"
-                        "- Taskbar / system tray state\n"
-                        "\n"
-                        "Be specific and thorough. Your description will be used by another AI "
-                        "to decide what actions to take on this screen."
-                    )),
-                    msgs[-1],  # injected HumanMessage with image_url
-                ]
-                vision_start = time.perf_counter()
-                if trace:
-                    trace.emit(
-                        "vision_started",
-                        model=self._vision_model,
-                        backend="vision",
-                    )
-                try:
-                    vision_resp = await self._vision_llm.ainvoke(vision_msgs)
-                    vision_text = display_content(vision_resp.content)
-                    # Append vision description as additional context
-                    msgs.append(
-                        HumanMessage(content=f"[Screen analysis]\n{vision_text}")
-                    )
-                    # Strip image blocks so text-only acting model does not reject them
-                    msgs = strip_image_content(msgs)
-                    if trace:
-                        trace.emit(
-                            "vision_completed",
-                            duration_ms=duration_ms(vision_start),
-                            content=vision_text,
-                            usage=getattr(vision_resp, "usage_metadata", None) or {},
-                        )
-                except Exception as exc:
-                    logger.warning("Vision call failed: %s", exc)
-                    # Strip images even on failure so acting model can proceed
-                    msgs = strip_image_content(msgs)
-                    if trace:
-                        trace.emit(
-                            "vision_failed",
-                            duration_ms=duration_ms(vision_start),
-                            error_type=type(exc).__name__,
-                            error=str(exc),
-                        )
+                msgs = await analyze_screenshot(
+                    msgs,
+                    self._vision_llm,
+                    self._vision_model,
+                    trace,
+                    log=logger,
+                    failure_message="Vision call failed: %s",
+                )
 
             start = time.perf_counter()
             if trace:
@@ -376,172 +308,11 @@ class AgentGraph:
         g.add_edge("tools", "agent")
         self._graph = g.compile()
 
-    async def _recall_context(
-        self,
-        user_text: str,
-        session_id: str,
-        trace: TraceCollector,
-        exclude_hashes: set[str] | None = None,
-    ) -> list[str]:
-        if not self._vector:
-            return []
-
-        recall_start = time.perf_counter()
-        trace.emit("memory_recall_started")
-        hits = await asyncio.to_thread(
-            self._vector.query, user_text, 3, session_id
-        )
-        recalled: list[str] = []
-        exclude = exclude_hashes or set()
-        for h in hits:
-            if h.get("distance", 1.0) >= 0.6:
-                continue
-            meta = h.get("meta") or {}
-            if meta.get("turn_hash", "") in exclude:
-                continue
-            recalled.append(h["text"])
-        trace.emit(
-            "memory_recall_completed",
-            duration_ms=duration_ms(recall_start),
-            matches=len(recalled),
-        )
-        return recalled
-
-    async def _load_history_messages(self, session_id: str, trace: TraceCollector) -> tuple[list[Any], str]:
-        """Load recent history within token budget. Returns (prior_messages, summary_string).
-
-        Oldest messages that exceed the budget are summarized via LLM call (best-effort).
-        Summary is prepended as context so truncated history is not lost.
-        """
-        if not self._chatdb:
-            return [], ""
-
-        history_start = time.perf_counter()
-        history = await asyncio.to_thread(self._chatdb.get_history, session_id, limit=0)
-        if not history:
-            trace.emit("memory_history_loaded", duration_ms=duration_ms(history_start), messages=0)
-            return [], ""
-
-        # Token-count from most-recent-first, keep only what fits in budget
-        budget = self._max_history_tokens
-        kept: list[dict] = []
-        token_count = 0
-        max_kept_id = 0
-
-        for m in reversed(history):  # most recent first
-            tokens = self._count_tokens(m["content"])
-            if token_count + tokens > budget and kept:
-                break
-            kept.append(m)
-            token_count += tokens
-            if m["id"] > max_kept_id:
-                max_kept_id = m["id"]
-
-        kept.reverse()  # back to chronological
-        dropped = [m for m in history if m not in kept]
-
-        summary = ""
-        if dropped:
-            summary = await self._summarize_session(session_id, dropped)
-
-        prior: list[Any] = []
-        for m in kept:
-            if m["role"] == "user":
-                prior.append(HumanMessage(content=m["content"]))
-            else:
-                prior.append(AIMessage(content=m["content"]))
-
-        trace.emit(
-            "memory_history_loaded",
-            duration_ms=duration_ms(history_start),
-            messages=len(prior),
-            dropped=len(dropped),
-            has_summary=bool(summary),
-        )
-        return prior, summary
-
-    async def _summarize_session(
-        self, session_id: str, dropped: list[dict]
-    ) -> str:
-        """Generate rolling summary of older truncated messages. Best-effort.
-
-        Caches summary keyed by session_id. Only regenerates when new messages
-        have appeared since the last summary was made.
-        """
-        if not dropped or self._llm is None:
-            return ""
-
-        max_id = max(m["id"] for m in dropped)
-        cached = self._summaries.get(session_id)
-        if cached and cached[1] >= max_id:
-            return cached[0]  # cached summary covers all dropped messages
-
-        # Build prompt from dropped messages
-        lines: list[str] = []
-        for m in dropped[:200]:  # cap to avoid overlong prompts
-            role = "User" if m["role"] == "user" else "Assistant"
-            lines.append(f"{role}: {m['content'][:300]}")
-        conversation = "\n\n".join(lines)
-
-        try:
-            resp = await asyncio.wait_for(
-                self._llm.ainvoke([
-                    SystemMessage(
-                        content="Summarize this conversation history in 2-3 concise sentences. "
-                        "Capture key topics, decisions, and facts. Be brief."
-                    ),
-                    HumanMessage(content=conversation),
-                ]),
-                timeout=30,
-            )
-            summary = display_content(resp.content).strip()
-            self._summaries[session_id] = (summary, max_id)
-            return summary
-        except Exception:
-            logger.warning("Session summary generation failed for %s", session_id)
-            return ""
-
-    def _build_turn_messages(
-        self,
-        user_text: str,
-        recalled: list[str],
-        prior: list[Any],
-        summary: str = "",
-    ) -> list[Any]:
-        msgs: list[Any] = []
-        if summary:
-            msgs.append(
-                SystemMessage(content=f"Earlier conversation summary:\n{summary}")
-            )
-        if recalled:
-            msgs.append(
-                SystemMessage(
-                    content="\n\nRelevant past context:\n" + "\n---\n".join(recalled)
-                )
-            )
-        msgs.extend(prior)
-        msgs.append(HumanMessage(content=user_text))
-        return msgs
-
-    @staticmethod
-    def _count_tokens(text: str) -> int:
-        """Approximate token count using char-length heuristic (1 token ≈ 4 chars)."""
-        return max(1, len(text) // 4)
-
     @staticmethod
     def _extract_final_text(
         out_msgs: list[Any], stopped_reason: str = ""
     ) -> str:
-        final = ""
-        for m in reversed(out_msgs):
-            if isinstance(m, AIMessage) and not getattr(m, "tool_calls", None):
-                final = display_content(m.content)
-                break
-        if not final:
-            for m in reversed(out_msgs):
-                if isinstance(m, AIMessage):
-                    final = display_content(m.content) if m.content else ""
-                    break
+        final = extract_final_ai_text(out_msgs)
         if final:
             if final.startswith("[Thinking]"):
                 logger.warning(
@@ -579,41 +350,6 @@ class AgentGraph:
             "Please try a simpler request or rephrase."
         )
 
-    async def _persist_turn(
-        self,
-        session_id: str,
-        user_text: str,
-        final: str,
-        trace: TraceCollector,
-    ) -> None:
-        persist_start = time.perf_counter()
-        if self._chatdb:
-            add_turn = getattr(self._chatdb, "add_turn", None)
-            if callable(add_turn):
-                await asyncio.to_thread(add_turn, session_id, user_text, final)
-            else:
-                await asyncio.to_thread(
-                    self._chatdb.add_message,
-                    session_id,
-                    "user",
-                    user_text,
-                )
-                await asyncio.to_thread(
-                    self._chatdb.add_message,
-                    session_id,
-                    "assistant",
-                    final,
-                )
-        if self._vector and final:
-            turn_hash = str(hash(user_text + "|" + final))
-            await asyncio.to_thread(
-                self._vector.add,
-                [str(uuid.uuid4())],
-                [f"User: {user_text}\nAssistant: {final}"],
-                [{"session_id": session_id, "turn_hash": turn_hash}],
-            )
-        trace.emit("memory_persisted", duration_ms=duration_ms(persist_start))
-
     async def chat(
         self,
         user_text: str,
@@ -632,14 +368,41 @@ class AgentGraph:
                 trace.emit("turn_started", session_id=session_id)
                 clear_screenshots()
                 try:
-                    prior, summary = await self._load_history_messages(session_id, trace)
+                    memory = self._memory_manager
+                    if memory is None:
+                        memory = MemoryManager(
+                            self._chatdb,
+                            self._vector,
+                            self._llm,
+                            self._max_history_tokens,
+                        )
+                        self._memory_manager = memory
+                    else:
+                        memory.chatdb = self._chatdb
+                        memory.vector = self._vector
+                        memory.llm = self._llm
+                        memory.max_history_tokens = self._max_history_tokens
+                    prior, summary = await memory._load_history_messages(
+                        session_id,
+                        trace,
+                    )
                     # Compute turn hashes from prior to deduplicate vector recall
                     prior_hashes: set[str] = set()
                     for i in range(0, len(prior) - 1, 2):
                         if isinstance(prior[i], HumanMessage) and isinstance(prior[i + 1], AIMessage):
                             prior_hashes.add(str(hash(str(prior[i].content) + "|" + str(prior[i + 1].content))))
-                    recalled = await self._recall_context(user_text, session_id, trace, prior_hashes)
-                    msgs = self._build_turn_messages(user_text, recalled, prior, summary)
+                    recalled = await memory._recall_context(
+                        user_text,
+                        session_id,
+                        trace,
+                        prior_hashes,
+                    )
+                    msgs = memory._build_turn_messages(
+                        user_text,
+                        recalled,
+                        prior,
+                        summary,
+                    )
                     state: AgentState = {
                         "messages": msgs,
                         "session_id": session_id,
@@ -653,7 +416,12 @@ class AgentGraph:
                     out_msgs = result.get("messages", [])
                     final = self._extract_final_text(out_msgs, result.get("stopped_reason", ""))
 
-                    await self._persist_turn(session_id, user_text, final, trace)
+                    await memory._persist_turn(
+                        session_id,
+                        user_text,
+                        final,
+                        trace,
+                    )
                     trace.emit(
                         "turn_completed",
                         duration_ms=duration_ms(turn_start),

@@ -10,10 +10,11 @@ from langgraph.graph import END, StateGraph
 from langgraph.prebuilt import ToolNode
 from typing_extensions import TypedDict
 
+from agent.agent_helpers import analyze_screenshot, extract_final_ai_text
 from agent.shared import activate_session, sanitize_aimessage
 from agent.subagents.types import SubAgentConfig, SubAgentResult
 from agent.trace import TraceCollector, activate_trace, display_content, duration_ms
-from agent.tools.computer import clear_screenshots, inject_screenshots, strip_image_content
+from agent.tools.computer import clear_screenshots
 
 logger = logging.getLogger(__name__)
 
@@ -133,62 +134,16 @@ class SubAgentManager:
 
             # ── Vision: inject screenshot images for vision model; strip before acting model ──
             if self._vision_llm is not None and msgs and isinstance(msgs[-1], ToolMessage) and getattr(msgs[-1], "name", None) == "computer_screenshot":
-                # Inject screenshot image into message list so vision model sees pixels
-                msgs = inject_screenshots(msgs)
-                # Minimal vision prompt: instruction + screenshot only (skip persona/history)
-                vision_msgs = [
-                    SystemMessage(content=(
-                        "You are a screen reader. Describe this screenshot in exact detail.\n"
-                        "Include:\n"
-                        "- Every visible window (title, position, content)\n"
-                        "- All UI elements (buttons, fields, menus, icons)\n"
-                        "- Any visible text (read it verbatim)\n"
-                        "- Mouse cursor position if visible\n"
-                        "- Coordinate grid labels (red numbers at edges)\n"
-                        "- Taskbar / system tray state\n"
-                        "\n"
-                        "Be specific and thorough. Your description will be used by another AI "
-                        "to decide what actions to take on this screen."
-                    )),
-                    msgs[-1],  # injected HumanMessage with image_url
-                ]
-                vision_start = time.perf_counter()
-                if trace:
-                    trace.emit(
-                        "vision_started",
-                        subagent_type=subagent_type,
-                        model=self._vision_model,
-                        backend="vision",
-                    )
-                try:
-                    vision_resp = await self._vision_llm.ainvoke(vision_msgs)
-                    vision_text = display_content(vision_resp.content)
-                    # Append vision description as additional context
-                    msgs.append(
-                        HumanMessage(content=f"[Screen analysis]\n{vision_text}")
-                    )
-                    # Strip image blocks so text-only acting model does not reject them
-                    msgs = strip_image_content(msgs)
-                    if trace:
-                        trace.emit(
-                            "vision_completed",
-                            subagent_type=subagent_type,
-                            duration_ms=duration_ms(vision_start),
-                            content=vision_text,
-                            usage=getattr(vision_resp, "usage_metadata", None) or {},
-                        )
-                except Exception as exc:
-                    logger.warning("Subagent '%s' vision call failed: %s", subagent_type, exc)
-                    # Strip images even on failure so acting model can proceed
-                    msgs = strip_image_content(msgs)
-                    if trace:
-                        trace.emit(
-                            "vision_failed",
-                            subagent_type=subagent_type,
-                            duration_ms=duration_ms(vision_start),
-                            error_type=type(exc).__name__,
-                            error=str(exc),
-                        )
+                msgs = await analyze_screenshot(
+                    msgs,
+                    self._vision_llm,
+                    self._vision_model,
+                    trace,
+                    trace_context={"subagent_type": subagent_type},
+                    log=logger,
+                    failure_message="Subagent '%s' vision call failed: %s",
+                    failure_args=(subagent_type,),
+                )
             # ── end vision block ──
 
             llm_call = state.get("llm_calls_made", 0) + 1
@@ -376,16 +331,7 @@ class SubAgentManager:
             )
 
         out_msgs = result.get("messages", [])
-        final = ""
-        for m in reversed(out_msgs):
-            if isinstance(m, AIMessage) and not getattr(m, "tool_calls", None):
-                final = display_content(m.content)
-                break
-        if not final:
-            for m in reversed(out_msgs):
-                if isinstance(m, AIMessage):
-                    final = display_content(m.content) if m.content else ""
-                    break
+        final = extract_final_ai_text(out_msgs)
         if not final:
             final = "Subagent completed but produced no text output."
         elif final.startswith("[Thinking]"):

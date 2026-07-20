@@ -4,6 +4,34 @@ from __future__ import annotations
 from typing import Any
 
 
+_OMIT_MODEL_KWARGS = object()
+
+
+def _build_openai_compatible(
+    ocfg: dict[str, Any],
+    default_model: str,
+    default_base_url: str,
+    temperature: float,
+    max_retries: int,
+    timeout: int,
+    extra_model_kwargs: Any = None,
+) -> Any:
+    """Build a ChatOpenAI client for an already selected compatible model."""
+    from langchain_openai import ChatOpenAI
+
+    kwargs: dict[str, Any] = {
+        "model": default_model,
+        "openai_api_key": ocfg.get("api_key", ""),
+        "openai_api_base": ocfg.get("base_url", default_base_url),
+        "temperature": temperature,
+    }
+    if extra_model_kwargs is not _OMIT_MODEL_KWARGS:
+        kwargs["model_kwargs"] = extra_model_kwargs
+    kwargs["timeout"] = timeout
+    kwargs["max_retries"] = max_retries
+    return ChatOpenAI(**kwargs)
+
+
 def build_llm(
     llm_cfg: dict[str, Any],
     backend: str,
@@ -32,7 +60,8 @@ def build_llm(
         return llm, model_name
 
     if backend == "deepseek":
-        from langchain_openai import ChatOpenAI
+        # Preserve the original dependency-error timing for this branch.
+        from langchain_openai import ChatOpenAI  # noqa: F401
 
         ocfg = llm_cfg.get("deepseek", {})
         if model_name is None:
@@ -46,14 +75,14 @@ def build_llm(
             extra_body["reasoning_effort"] = reasoning
         if extra_body:
             model_kwargs["extra_body"] = extra_body
-        llm = ChatOpenAI(
-            model=model_name,
-            openai_api_key=ocfg.get("api_key", ""),
-            openai_api_base=ocfg.get("base_url", "https://api.deepseek.com"),
-            temperature=temperature,
-            model_kwargs=model_kwargs if model_kwargs else None,
-            timeout=timeout,
-            max_retries=max_retries,
+        llm = _build_openai_compatible(
+            ocfg,
+            model_name,
+            "https://api.deepseek.com",
+            temperature,
+            max_retries,
+            timeout,
+            extra_model_kwargs=model_kwargs if model_kwargs else None,
         )
         return llm, model_name
 
@@ -75,17 +104,19 @@ def build_llm(
         return llm, model_name
 
     # default: openrouter
-    from langchain_openai import ChatOpenAI
+    # Preserve the original dependency-error timing for this branch.
+    from langchain_openai import ChatOpenAI  # noqa: F401
 
     ocfg = llm_cfg.get("openrouter", {})
     if model_name is None:
         model_name = str(ocfg.get("model", "z-ai/glm-4.5"))
-    llm = ChatOpenAI(
-        model=model_name,
-        openai_api_key=ocfg.get("api_key", ""),
-        openai_api_base=ocfg.get("base_url", "https://openrouter.ai/api/v1"),
-        temperature=temperature,
-        timeout=timeout,
-        max_retries=max_retries,
+    llm = _build_openai_compatible(
+        ocfg,
+        model_name,
+        "https://openrouter.ai/api/v1",
+        temperature,
+        max_retries,
+        timeout,
+        extra_model_kwargs=_OMIT_MODEL_KWARGS,
     )
     return llm, model_name

@@ -17,6 +17,8 @@ import yaml
 from mcp import ClientSession, StdioServerParameters, stdio_client
 from mcp.types import CallToolResult, ImageContent, Tool as MCPTool
 
+from agent.config_utils import expand_env_vars
+
 ImageContent.model_fields["type"].annotation = Literal["image", "blob"]
 ImageContent.model_rebuild(force=True)
 CallToolResult.model_rebuild(force=True)
@@ -55,26 +57,7 @@ class MCPManager:
     def _load_config(self) -> dict[str, Any]:
         with open(self.config_path, "r", encoding="utf-8") as f:
             raw = yaml.safe_load(f)
-        self._expand(raw)
-        return raw
-
-    @staticmethod
-    def _expand(obj: Any) -> None:
-        import os
-        if isinstance(obj, str):
-            pass  # string values don't need in-place expansion
-        elif isinstance(obj, dict):
-            for k, v in obj.items():
-                if isinstance(v, str):
-                    obj[k] = os.path.expandvars(v)  # type: ignore[arg-type]
-                else:
-                    MCPManager._expand(v)
-        elif isinstance(obj, list):
-            for i, v in enumerate(obj):
-                if isinstance(v, str):
-                    obj[i] = os.path.expandvars(v)  # type: ignore[index]
-                else:
-                    MCPManager._expand(v)
+        return expand_env_vars(raw)
 
     def _parse_servers(self, raw: dict[str, Any]) -> None:
         for name, cfg in raw.items():
@@ -86,6 +69,42 @@ class MCPManager:
                 env=cfg.get("env"),
                 tool_include=cfg.get("tool_include"),
             )
+
+    @staticmethod
+    def _server_environment(server: MCPServerConfig) -> dict[str, str]:
+        """Return the parent environment with server-specific overrides."""
+        environment = dict(os.environ)
+        if server.env:
+            environment.update(server.env)
+        return environment
+
+    @staticmethod
+    def _resolve_command(command: str) -> str:
+        """Prefer a command from the active virtual environment when available."""
+        if os.sep in command or os.altsep in command:
+            return command
+
+        venv_scripts = os.path.dirname(sys.executable)
+        for candidate in (
+            os.path.join(venv_scripts, command),
+            os.path.join(venv_scripts, command + ".exe"),
+        ):
+            if os.path.isfile(candidate):
+                return candidate
+        return command
+
+    def _remove_server_tools(self, server_name: str) -> None:
+        """Remove cached tool definitions that belong to one server."""
+        for tool_name, owner in list(self._tools.items()):
+            if owner == server_name:
+                self._tools.pop(tool_name, None)
+                self._tool_defs.pop(tool_name, None)
+
+    def _cache_server_tools(self, server_name: str, tools: list[MCPTool]) -> None:
+        """Associate the supplied tool definitions with their server."""
+        for tool in tools:
+            self._tools[tool.name] = server_name
+            self._tool_defs[tool.name] = tool
 
     async def start(self) -> None:
         """Spawn all MCP servers and connect sessions."""
@@ -108,19 +127,13 @@ class MCPManager:
         srv = self._servers[name]
         stack = AsyncExitStack()
         try:
-            merged_env = dict(os.environ)
-            if srv.env:
-                merged_env.update(srv.env)
-            # Resolve command to venv Scripts if bare name (needed when PATH lacks venv dir)
-            cmd = srv.command
-            if os.sep not in cmd and os.altsep not in cmd:
-                venv_scripts = os.path.dirname(sys.executable)
-                for candidate in (os.path.join(venv_scripts, cmd),
-                                  os.path.join(venv_scripts, cmd + ".exe")):
-                    if os.path.isfile(candidate):
-                        cmd = candidate
-                        break
-            params = StdioServerParameters(command=cmd, args=srv.args, env=merged_env)
+            merged_env = self._server_environment(srv)
+            command = self._resolve_command(srv.command)
+            params = StdioServerParameters(
+                command=command,
+                args=srv.args,
+                env=merged_env,
+            )
             read, write = await stack.enter_async_context(stdio_client(params))
             session = await stack.enter_async_context(ClientSession(read, write))
             await session.initialize()
@@ -134,13 +147,8 @@ class MCPManager:
         old_stack = self._server_stacks.pop(name, None)
         self._sessions[name] = session
         self._server_stacks[name] = stack
-        for tool_name, server_name in list(self._tools.items()):
-            if server_name == name:
-                self._tools.pop(tool_name, None)
-                self._tool_defs.pop(tool_name, None)
-        for tool in tools:
-            self._tools[tool.name] = name
-            self._tool_defs[tool.name] = tool
+        self._remove_server_tools(name)
+        self._cache_server_tools(name, tools)
         self._healthy[name] = True
         self._restart_failures[name] = 0
         self._retry_after.pop(name, None)
@@ -166,9 +174,7 @@ class MCPManager:
             try:
                 resp = await session.list_tools()
                 out.extend(resp.tools)
-                for t in resp.tools:
-                    self._tools[t.name] = name
-                    self._tool_defs[t.name] = t
+                self._cache_server_tools(name, resp.tools)
             except Exception as e:
                 logger.error("list_tools failed for '%s': %s", name, e)
         return out

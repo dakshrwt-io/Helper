@@ -1,0 +1,11 @@
+agent:
+  persona_path: ${PERSONA_PATH}
+memory:
+  sqlite: ${DATA_DIR}/history.db
+  chroma: ${DATA_DIR}/chroma
+mcp:
+  endpoint: ${SERVICE_HOST}/api
+  nested:
+    - ${SERVICE_HOST}
+    - path: ${DATA_DIR}/nested
+  number: 7

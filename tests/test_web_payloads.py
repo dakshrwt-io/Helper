@@ -21,7 +21,7 @@ def test_status_payload_reports_tools() -> None:
 
 
 def test_answer_payload_shape() -> None:
-    payload = _answer_payload({"text": "done"}, _Graph())
+    payload = _answer_payload({"text": "done"})
 
     assert payload == {
         "type": "answer",

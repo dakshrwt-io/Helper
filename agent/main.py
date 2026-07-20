@@ -101,7 +101,7 @@ def _status_payload(graph=None) -> dict:
     }
 
 
-def _answer_payload(result: dict, graph=None) -> dict:
+def _answer_payload(result: dict) -> dict:
     return {
         "type": "answer",
         "text": result["text"],
@@ -161,6 +161,39 @@ async def health():
     return JSONResponse({"status": "ok"})
 
 
+async def _drain_trace_queue(
+    ws: WebSocket,
+    trace_queue: asyncio.Queue[dict],
+    *,
+    suppress_send_errors: bool = False,
+) -> None:
+    """Forward all currently queued trace events to the WebSocket."""
+    while not trace_queue.empty():
+        if suppress_send_errors:
+            try:
+                await ws.send_json({"type": "trace", "event": trace_queue.get_nowait()})
+            except Exception:
+                break
+        else:
+            await ws.send_json({"type": "trace", "event": trace_queue.get_nowait()})
+
+
+async def _wait_for_first(
+    primary_task: asyncio.Task,
+    *watch_tasks: asyncio.Task | None,
+    timeout: float | None = None,
+) -> set[asyncio.Task]:
+    """Wait for the primary task or one of its existing watcher tasks."""
+    waiting = {primary_task}
+    waiting.update(task for task in watch_tasks if task is not None)
+    done, _ = await asyncio.wait(
+        waiting,
+        timeout=timeout,
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    return done
+
+
 async def _run_chat_with_trace(ws: WebSocket, user_text: str, session_id: str, cancel_event: asyncio.Event | None = None) -> dict:
     """Run a turn while forwarding its internal execution events to the client."""
     graph = get_graph()
@@ -186,15 +219,11 @@ async def _run_chat_with_trace(ws: WebSocket, user_text: str, session_id: str, c
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 raise asyncio.TimeoutError
-            waiting = {chat_task}
-            if event_task is not None:
-                waiting.add(event_task)
-            if cancel_watch is not None:
-                waiting.add(cancel_watch)
-            done, _ = await asyncio.wait(
-                waiting,
+            done = await _wait_for_first(
+                chat_task,
+                event_task,
+                cancel_watch,
                 timeout=remaining,
-                return_when=asyncio.FIRST_COMPLETED,
             )
             if not done:
                 raise asyncio.TimeoutError
@@ -202,11 +231,7 @@ async def _run_chat_with_trace(ws: WebSocket, user_text: str, session_id: str, c
             if cancel_watch is not None and cancel_watch in done:
                 chat_task.cancel()
                 # Drain remaining trace events so client gets clean state
-                while not trace_queue.empty():
-                    try:
-                        await ws.send_json({"type": "trace", "event": trace_queue.get_nowait()})
-                    except Exception:
-                        break
+                await _drain_trace_queue(ws, trace_queue, suppress_send_errors=True)
                 raise asyncio.CancelledError("cancel requested")
 
             if event_task is not None and event_task in done:
@@ -214,8 +239,7 @@ async def _run_chat_with_trace(ws: WebSocket, user_text: str, session_id: str, c
                 event_task = None
 
             if chat_task in done:
-                while not trace_queue.empty():
-                    await ws.send_json({"type": "trace", "event": trace_queue.get_nowait()})
+                await _drain_trace_queue(ws, trace_queue)
                 return chat_task.result()
 
             if event_task is None:
@@ -327,10 +351,7 @@ async def chat_ws(ws: WebSocket):
             try:
                 while not chat_task.done():
                     recv_task = asyncio.create_task(ws.receive_text())
-                    done, _ = await asyncio.wait(
-                        {chat_task, recv_task},
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
+                    done = await _wait_for_first(chat_task, recv_task)
                     if recv_task in done:
                         try:
                             raw_inner = recv_task.result()
@@ -349,7 +370,7 @@ async def chat_ws(ws: WebSocket):
 
                 result = await chat_task
                 async with ws_lock:
-                    await ws.send_json(_answer_payload(result, graph))
+                    await ws.send_json(_answer_payload(result))
             except asyncio.CancelledError:
                 pass  # cancel already sent via cancelled message above
             except asyncio.TimeoutError:

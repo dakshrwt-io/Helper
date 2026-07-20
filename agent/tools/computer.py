@@ -404,8 +404,8 @@ async def _exec_drag(
 
 def get_computer_tools() -> list[StructuredTool]:
     """Build and return all computer-control StructuredTools."""
-    return [
-        _wrap_tool(
+    specs = [
+        (
             "computer_screenshot",
             "Capture a screenshot of the entire primary screen. Use this when you need "
             "to see what is on screen — identifying UI elements, verifying an action "
@@ -413,51 +413,51 @@ def get_computer_tools() -> list[StructuredTool]:
             BaseModel,
             _exec_screenshot,
         ),
-        _wrap_tool(
+        (
             "computer_get_screen_size",
             "Get the width and height of the primary monitor in pixels.",
             BaseModel,
             _exec_get_screen_size,
         ),
-        _wrap_tool(
+        (
             "computer_get_mouse_position",
             "Get the current (x, y) position of the mouse cursor.",
             BaseModel,
             _exec_get_mouse_position,
         ),
-        _wrap_tool(
+        (
             "computer_move_mouse",
             "Move the mouse cursor to absolute (x, y) coordinates on the primary "
             "monitor. (0,0) is the top-left corner.",
             _MoveMouseArgs,
             _exec_move_mouse,
         ),
-        _wrap_tool(
+        (
             "computer_click",
             "Click the left/right/middle mouse button at absolute (x, y) coordinates.",
             _ClickArgs,
             _exec_click,
         ),
-        _wrap_tool(
+        (
             "computer_double_click",
             "Double-click the left mouse button at absolute (x, y) coordinates.",
             _DoubleClickArgs,
             _exec_double_click,
         ),
-        _wrap_tool(
+        (
             "computer_right_click",
             "Right-click at absolute (x, y) coordinates (context menu).",
             _RightClickArgs,
             _exec_right_click,
         ),
-        _wrap_tool(
+        (
             "computer_type_text",
             "Type a string of text as if typed on the keyboard. The target window "
             "must already have focus. Use computer_click first to focus a field.",
             _TypeTextArgs,
             _exec_type_text,
         ),
-        _wrap_tool(
+        (
             "computer_press_key",
             "Press and release a single keyboard key. Common keys: 'enter', 'esc', "
             "'tab', 'backspace', 'delete', 'home', 'end', 'pageup', 'pagedown', "
@@ -465,7 +465,7 @@ def get_computer_tools() -> list[StructuredTool]:
             _PressKeyArgs,
             _exec_press_key,
         ),
-        _wrap_tool(
+        (
             "computer_hotkey",
             "Press a key combination. Use '+' to separate keys. Examples: "
             "'ctrl+c' (copy), 'ctrl+v' (paste), 'alt+tab' (switch windows), "
@@ -473,14 +473,14 @@ def get_computer_tools() -> list[StructuredTool]:
             _HotkeyArgs,
             _exec_hotkey,
         ),
-        _wrap_tool(
+        (
             "computer_scroll",
             "Scroll the mouse wheel. Positive clicks = scroll up, negative = down. "
             "Typical values: 1-5 clicks for small scrolls, 10+ for longer.",
             _ScrollArgs,
             _exec_scroll,
         ),
-        _wrap_tool(
+        (
             "computer_drag",
             "Click and drag from (start_x, start_y) to (end_x, end_y). Useful for "
             "moving windows, selecting text, or drag-and-drop operations.",
@@ -488,3 +488,4 @@ def get_computer_tools() -> list[StructuredTool]:
             _exec_drag,
         ),
     ]
+    return [_wrap_tool(*spec) for spec in specs]
