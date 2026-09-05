@@ -192,6 +192,3 @@ Runtime data is stored under `DATA_DIR` (default: `data/`) and is ignored by Git
 | Telegram does not start | Set `TELEGRAM_ENABLED=true`, provide a token, and check `TELEGRAM_ALLOWED_USERS`. |
 | Need logs | Run `pm2 logs ai-agent --err --lines 50`, or inspect console output from `python run_server.py`. |
 
-## Git hygiene
-
-Do not commit `.env`, `data/`, logs, certificates, private keys, or local credentials. The repository’s `.gitignore` covers these local artifacts, while `.env.example` remains intentionally tracked as a safe setup template.
