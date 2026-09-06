@@ -308,6 +308,27 @@ class _RightClickArgs(BaseModel):
 
 
 # ── Tool implementations ────────────────────────────────────────────
+#
+# Most tools share the same shape: ensure PyAutoGUI, run one call in a
+# thread, format the reply. _simple_tool builds them from a table entry;
+# screenshot/hotkey/drag keep dedicated handlers for their extra steps.
+
+
+def _simple_tool(
+    name: str,
+    desc: str,
+    args_schema: type[BaseModel],
+    action: Any,
+    fmt: Any,
+) -> StructuredTool:
+    """Build a StructuredTool that runs ``action(**kwargs)`` off-thread."""
+
+    async def _run(**kwargs: Any) -> str:
+        _ensure_pyautogui()
+        result = await asyncio.to_thread(action, **kwargs)
+        return fmt(result, kwargs)
+
+    return _wrap_tool(name, desc, args_schema, _run)
 
 
 async def _exec_screenshot(**kwargs: Any) -> str:
@@ -325,55 +346,6 @@ async def _exec_screenshot(**kwargs: Any) -> str:
     )
 
 
-async def _exec_get_screen_size(**kwargs: Any) -> str:
-    _ensure_pyautogui()
-    w, h = await asyncio.to_thread(pyautogui.size)
-    return f"Screen size: {w}\u00d7{h} (primary monitor)"
-
-
-async def _exec_get_mouse_position(**kwargs: Any) -> str:
-    _ensure_pyautogui()
-    x, y = await asyncio.to_thread(pyautogui.position)
-    return f"Mouse position: ({x}, {y})"
-
-
-async def _exec_move_mouse(x: int, y: int) -> str:
-    _ensure_pyautogui()
-    await asyncio.to_thread(pyautogui.moveTo, x, y)
-    return f"Moved mouse to ({x}, {y})"
-
-
-async def _exec_click(x: int, y: int, button: str = "left") -> str:
-    _ensure_pyautogui()
-    await asyncio.to_thread(pyautogui.click, x, y, button=button)
-    return f"Clicked {button} at ({x}, {y})"
-
-
-async def _exec_double_click(x: int, y: int) -> str:
-    _ensure_pyautogui()
-    await asyncio.to_thread(pyautogui.doubleClick, x, y)
-    return f"Double-clicked at ({x}, {y})"
-
-
-async def _exec_right_click(x: int, y: int) -> str:
-    _ensure_pyautogui()
-    await asyncio.to_thread(pyautogui.rightClick, x, y)
-    return f"Right-clicked at ({x}, {y})"
-
-
-async def _exec_type_text(text: str, interval: float = 0.05) -> str:
-    _ensure_pyautogui()
-    await asyncio.to_thread(pyautogui.write, text, interval=interval)
-    preview = text if len(text) <= 60 else text[:57] + "..."
-    return f"Typed: {preview}"
-
-
-async def _exec_press_key(key: str) -> str:
-    _ensure_pyautogui()
-    await asyncio.to_thread(pyautogui.press, key)
-    return f"Pressed key: {key}"
-
-
 async def _exec_hotkey(keys: str) -> str:
     _ensure_pyautogui()
     combo = [k.strip().lower() for k in keys.split("+")]
@@ -381,13 +353,6 @@ async def _exec_hotkey(keys: str) -> str:
     if "win" in combo:
         await asyncio.sleep(0.3)
     return f"Pressed hotkey: {keys}"
-
-
-async def _exec_scroll(clicks: int) -> str:
-    _ensure_pyautogui()
-    await asyncio.to_thread(pyautogui.scroll, clicks)
-    direction = "up" if clicks > 0 else "down"
-    return f"Scrolled {direction} by {abs(clicks)} clicks"
 
 
 async def _exec_drag(
@@ -404,58 +369,59 @@ async def _exec_drag(
 
 def get_computer_tools() -> list[StructuredTool]:
     """Build and return all computer-control StructuredTools."""
-    specs = [
-        (
-            "computer_screenshot",
-            "Capture a screenshot of the entire primary screen. Use this when you need "
-            "to see what is on screen — identifying UI elements, verifying an action "
-            "completed, or checking the current state.",
-            BaseModel,
-            _exec_screenshot,
-        ),
+    simple = [
         (
             "computer_get_screen_size",
             "Get the width and height of the primary monitor in pixels.",
             BaseModel,
-            _exec_get_screen_size,
+            lambda: pyautogui.size(),
+            lambda r, _a: f"Screen size: {r[0]}\u00d7{r[1]} (primary monitor)",
         ),
         (
             "computer_get_mouse_position",
             "Get the current (x, y) position of the mouse cursor.",
             BaseModel,
-            _exec_get_mouse_position,
+            lambda: pyautogui.position(),
+            lambda r, _a: f"Mouse position: ({r[0]}, {r[1]})",
         ),
         (
             "computer_move_mouse",
             "Move the mouse cursor to absolute (x, y) coordinates on the primary "
             "monitor. (0,0) is the top-left corner.",
             _MoveMouseArgs,
-            _exec_move_mouse,
+            lambda x, y: pyautogui.moveTo(x, y),
+            lambda _r, a: f"Moved mouse to ({a['x']}, {a['y']})",
         ),
         (
             "computer_click",
             "Click the left/right/middle mouse button at absolute (x, y) coordinates.",
             _ClickArgs,
-            _exec_click,
+            lambda x, y, button="left": pyautogui.click(x, y, button=button),
+            lambda _r, a: f"Clicked {a['button']} at ({a['x']}, {a['y']})",
         ),
         (
             "computer_double_click",
             "Double-click the left mouse button at absolute (x, y) coordinates.",
             _DoubleClickArgs,
-            _exec_double_click,
+            lambda x, y: pyautogui.doubleClick(x, y),
+            lambda _r, a: f"Double-clicked at ({a['x']}, {a['y']})",
         ),
         (
             "computer_right_click",
             "Right-click at absolute (x, y) coordinates (context menu).",
             _RightClickArgs,
-            _exec_right_click,
+            lambda x, y: pyautogui.rightClick(x, y),
+            lambda _r, a: f"Right-clicked at ({a['x']}, {a['y']})",
         ),
         (
             "computer_type_text",
             "Type a string of text as if typed on the keyboard. The target window "
             "must already have focus. Use computer_click first to focus a field.",
             _TypeTextArgs,
-            _exec_type_text,
+            lambda text, interval=0.05: pyautogui.write(text, interval=interval),
+            lambda _r, a: (
+                f"Typed: {a['text'] if len(a['text']) <= 60 else a['text'][:57] + '...'}"
+            ),
         ),
         (
             "computer_press_key",
@@ -463,7 +429,28 @@ def get_computer_tools() -> list[StructuredTool]:
             "'tab', 'backspace', 'delete', 'home', 'end', 'pageup', 'pagedown', "
             "'up', 'down', 'left', 'right', 'f1'-'f12', 'win', 'alt', 'ctrl'.",
             _PressKeyArgs,
-            _exec_press_key,
+            lambda key: pyautogui.press(key),
+            lambda _r, a: f"Pressed key: {a['key']}",
+        ),
+        (
+            "computer_scroll",
+            "Scroll the mouse wheel. Positive clicks = scroll up, negative = down. "
+            "Typical values: 1-5 clicks for small scrolls, 10+ for longer.",
+            _ScrollArgs,
+            lambda clicks: pyautogui.scroll(clicks),
+            lambda _r, a: (
+                f"Scrolled {'up' if a['clicks'] > 0 else 'down'} by {abs(a['clicks'])} clicks"
+            ),
+        ),
+    ]
+    custom = [
+        (
+            "computer_screenshot",
+            "Capture a screenshot of the entire primary screen. Use this when you need "
+            "to see what is on screen — identifying UI elements, verifying an action "
+            "completed, or checking the current state.",
+            BaseModel,
+            _exec_screenshot,
         ),
         (
             "computer_hotkey",
@@ -474,13 +461,6 @@ def get_computer_tools() -> list[StructuredTool]:
             _exec_hotkey,
         ),
         (
-            "computer_scroll",
-            "Scroll the mouse wheel. Positive clicks = scroll up, negative = down. "
-            "Typical values: 1-5 clicks for small scrolls, 10+ for longer.",
-            _ScrollArgs,
-            _exec_scroll,
-        ),
-        (
             "computer_drag",
             "Click and drag from (start_x, start_y) to (end_x, end_y). Useful for "
             "moving windows, selecting text, or drag-and-drop operations.",
@@ -488,4 +468,6 @@ def get_computer_tools() -> list[StructuredTool]:
             _exec_drag,
         ),
     ]
-    return [_wrap_tool(*spec) for spec in specs]
+    return [_simple_tool(*spec) for spec in simple] + [
+        _wrap_tool(*spec) for spec in custom
+    ]

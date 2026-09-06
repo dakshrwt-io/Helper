@@ -97,7 +97,7 @@ class MemoryManager:
                 max_kept_id = message["id"]
 
         kept.reverse()  # back to chronological
-        dropped = [message for message in history if message not in kept]
+        dropped = [message for message in history if message["id"] < max_kept_id]
 
         summary = ""
         if dropped:

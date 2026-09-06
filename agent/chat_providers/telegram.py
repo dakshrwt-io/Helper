@@ -11,7 +11,6 @@ from telegram import Update
 from telegram.constants import ParseMode
 from telegram.error import RetryAfter, TimedOut, NetworkError
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
-from telegram.helpers import escape_markdown
 
 from agent.shared import get_graph, get_chat_lock, get_chat_bus, get_cancel_event, request_cancel
 from agent.tools.computer import grant_desktop_lease, revoke_desktop_lease
@@ -46,24 +45,11 @@ def _check_access(update: Update) -> tuple[bool, int | None]:
     return True, user_id
 
 
-def _split_by_length(text: str, limit: int, chunks: list[str]) -> None:
-    """Split a long run-on string by byte length into chunks."""
+def _byte_chunks(text: str, limit: int, chunks: list[str]) -> str:
+    """Append full limit-sized UTF-8 byte chunks of text to chunks; return remainder."""
     b = text.encode("utf-8")
     pos = 0
-    while pos < len(b):
-        end = min(pos + limit, len(b))
-        chunk = b[pos:end].decode("utf-8", errors="ignore")
-        chunks.append(chunk)
-        pos = end
-
-
-def _split_overlong(text: str, limit: int, chunks: list[str]) -> str:
-    """Handle a single sentence that exceeds the limit: split by length, return leftover."""
-    b = text.encode("utf-8")
-    if len(b) <= limit:
-        return text
-    pos = 0
-    while pos + limit < len(b):
+    while len(b) - pos > limit:
         chunks.append(b[pos:pos + limit].decode("utf-8", errors="ignore"))
         pos += limit
     return b[pos:].decode("utf-8", errors="ignore")
@@ -83,21 +69,17 @@ def _split_message(text: str, limit: int = _MAX_TELEGRAM_LEN) -> list[str]:
         if len(para.encode("utf-8")) <= limit:
             chunks.append(para)
         else:
-            sentences = re.split(r"(?<=[.!?])\s+", para)
-            if len(sentences) <= 1:
-                _split_by_length(para, limit, chunks)
-            else:
-                buf = ""
-                for s in sentences:
-                    candidate = (buf + " " + s).strip() if buf else s
-                    if len(candidate.encode("utf-8")) <= limit:
-                        buf = candidate
-                    else:
-                        if buf:
-                            chunks.append(buf)
-                        buf = _split_overlong(s, limit, chunks)
+            buf = ""
+            for s in re.split(r"(?<=[.!?])\s+", para):
+                candidate = (buf + " " + s).strip() if buf else s
+                if len(candidate.encode("utf-8")) <= limit:
+                    buf = candidate
+                    continue
                 if buf:
                     chunks.append(buf)
+                buf = _byte_chunks(s, limit, chunks)
+            if buf:
+                chunks.append(buf)
 
     if not chunks:
         return [text[:limit]]
@@ -286,10 +268,7 @@ async def message_handler(update: Update, _context: Any) -> None:
 
     user_text = update.message.text.strip()
     chat_id = update.effective_chat.id
-    try:
-        session_id = _context.user_data.get("session_id")
-    except Exception:
-        session_id = None
+    session_id = _context.user_data.get("session_id")
     if not session_id:
         session_id = f"telegram_{chat_id}"
         _context.user_data["session_id"] = session_id

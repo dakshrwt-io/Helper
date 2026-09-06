@@ -37,7 +37,14 @@ def _schema_to_pydantic(tool_name: str, schema: dict[str, Any]) -> type[BaseMode
 def _make_tool(mcp_tool: MCPTool, mgr: MCPManager) -> StructuredTool:
     name = mcp_tool.name
     desc = mcp_tool.description or name
-    schema = mcp_tool.inputSchema or {"type": "object", "properties": {}}
+    # MCP 1.x exposed JSON-schema fields as ``inputSchema``; MCP 2.x uses
+    # Pydantic's normalized ``input_schema`` name. Support both while users
+    # transition between server/client versions.
+    schema = (
+        getattr(mcp_tool, "input_schema", None)
+        or getattr(mcp_tool, "inputSchema", None)
+        or {"type": "object", "properties": {}}
+    )
     args_model = _schema_to_pydantic(name, schema)
 
     async def _run(**kwargs: Any) -> str:

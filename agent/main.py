@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import hmac
 import json
@@ -21,7 +22,6 @@ from agent.shared import get_graph, get_chat_lock, get_chat_bus, get_cancel_even
 from agent.tools.computer import grant_desktop_lease, revoke_desktop_lease
 
 load_dotenv()
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("agent.web")
 
 
@@ -87,18 +87,6 @@ def _authenticate_ws(ws: WebSocket) -> str | None:
     ):
         return f"web_{secrets.token_hex(16)}"
     return None
-
-
-def _tool_count(graph) -> int:
-    return len(graph.mcp.tool_names) if graph and graph.mcp else 0
-
-
-def _status_payload(graph=None) -> dict:
-    graph = get_graph() if graph is None else graph
-    return {
-        "status": "ok",
-        "tools": _tool_count(graph),
-    }
 
 
 def _answer_payload(result: dict) -> dict:
@@ -383,10 +371,8 @@ async def chat_ws(ws: WebSocket):
             finally:
                 if not chat_task.done():
                     chat_task.cancel()
-                    try:
+                    with contextlib.suppress(asyncio.CancelledError):
                         await chat_task
-                    except (asyncio.CancelledError, Exception):
-                        pass
     except WebSocketDisconnect:
         logger.info("WS disconnected")
     finally:
@@ -407,12 +393,8 @@ def create_app(graph):
     return app
 
 
-def main():
+if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("WEB_PORT", "8000"))
     host = os.environ.get("WEB_HOST", "127.0.0.1")
     uvicorn.run("agent.main:app", host=host, port=port, reload=False)
-
-
-if __name__ == "__main__":
-    main()

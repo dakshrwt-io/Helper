@@ -2,14 +2,13 @@
 from __future__ import annotations
 
 import logging
-import os
 import uuid
 from dataclasses import dataclass
 from typing import Any
 
 import yaml
 
-from agent.config_utils import expand_env_vars
+from agent.config_utils import expand_env_vars, require_expanded
 from agent.memory.db import ChatDB
 from agent.memory.vector import VectorStore
 
@@ -36,8 +35,9 @@ def load_agent_config(config_path: str) -> LoadedAgentConfig:
     config = expand_env_vars(raw)
     agent_config = config.get("agent", {})
     max_history_tokens = int(agent_config.get("max_history_tokens", 4000))
-    persona_path = os.path.expandvars(
-        agent_config.get("persona_path", "agent/persona.md")
+    persona_path = require_expanded(
+        agent_config.get("persona_path", "agent/persona.md"),
+        "agent.persona_path",
     )
     try:
         with open(persona_path, "r", encoding="utf-8") as file:
@@ -47,10 +47,14 @@ def load_agent_config(config_path: str) -> LoadedAgentConfig:
 
     memory_config = config.get("memory", {})
     chatdb = ChatDB(
-        os.path.expandvars(memory_config.get("sqlite", "data/history.db"))
+        require_expanded(
+            memory_config.get("sqlite", "data/history.db"), "memory.sqlite"
+        )
     )
     vector = VectorStore(
-        os.path.expandvars(memory_config.get("chroma", "data/chroma"))
+        require_expanded(
+            memory_config.get("chroma", "data/chroma"), "memory.chroma"
+        )
     )
 
     if vector.count() == 0:

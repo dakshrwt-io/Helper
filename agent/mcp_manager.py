@@ -19,6 +19,9 @@ from mcp.types import CallToolResult, ImageContent, Tool as MCPTool
 
 from agent.config_utils import expand_env_vars
 
+# mcp >= 2.x validates ImageContent.type against Literal["image", "blob"] only
+# after this forced annotation/rebuild; without it, some server responses fail
+# pydantic parsing. Revisit when upgrading the mcp package.
 ImageContent.model_fields["type"].annotation = Literal["image", "blob"]
 ImageContent.model_rebuild(force=True)
 CallToolResult.model_rebuild(force=True)
@@ -213,8 +216,11 @@ class MCPManager:
             self._health_task.cancel()
 
     async def _health_loop(self) -> None:
+        first = True
         while True:
-            await asyncio.sleep(min(self._health_interval, 5.0))
+            # First probe shortly after startup, then poll at the configured interval.
+            await asyncio.sleep(5.0 if first else self._health_interval)
+            first = False
             for name in list(self._servers):
                 await self._ping_server(name)
 
@@ -250,10 +256,6 @@ class MCPManager:
                 logger.log(
                     level, "MCP server '%s' restart failed: %s", name, restart_exc
                 )
-
-    @property
-    def healthy_servers(self) -> list[str]:
-        return [n for n, h in self._healthy.items() if h]
 
     async def stop(self) -> None:
         """Shut down all MCP server subprocesses."""

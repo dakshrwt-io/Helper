@@ -51,20 +51,10 @@ memory:
   sqlite: ${DATA_DIR}/history.db
   chroma:  ${DATA_DIR}/chroma
 
-web:
-  port: ${WEB_PORT}
-  host: 127.0.0.1
-  auth: true
-
-telegram:
-  enabled: ${TELEGRAM_ENABLED}
-  token: ${TELEGRAM_BOT_TOKEN}
-  allowed_users: ${TELEGRAM_ALLOWED_USERS}
-
+# Only `enabled` is read here; lease length and rate limit are configured via
+# the COMPUTER_CONTROL_* environment variables in .env.
 computer_control:
   enabled: ${COMPUTER_CONTROL_ENABLED}
-  lease_seconds: 300
-  rate_limit: 30
 
 agent:
   persona_path: ${PERSONA_PATH}

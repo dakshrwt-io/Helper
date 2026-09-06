@@ -1,19 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Any
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import HumanMessage
 from langchain_core.tools import StructuredTool
-from langgraph.graph import END, StateGraph
-from langgraph.prebuilt import ToolNode
 from typing_extensions import TypedDict
 
-from agent.agent_helpers import analyze_screenshot, extract_final_ai_text
-from agent.shared import activate_session, sanitize_aimessage
+from agent.react import build_react_graph
+from agent.shared import activate_session
 from agent.subagents.types import SubAgentConfig, SubAgentResult
-from agent.trace import TraceCollector, activate_trace, display_content, duration_ms
+from agent.trace import TraceCollector, duration_ms
 from agent.tools.computer import clear_screenshots
 
 logger = logging.getLogger(__name__)
@@ -25,7 +24,8 @@ class SubAgentState(TypedDict, total=False):
     llm_calls_made: int
     trace: TraceCollector
     started_at: float
-    stopped_reason: str  # "max_iterations" | "max_seconds" | ""
+    stopped_reason: str  # "max_iterations" | "max_seconds" | "cancelled" | ""
+    cancel_event: Any  # asyncio.Event — cooperative cancellation token
 
 
 class SubAgentManager:
@@ -53,8 +53,6 @@ class SubAgentManager:
 
         self._configs: dict[str, SubAgentConfig] = {}
         self._graphs: dict[str, Any] = {}
-        self._bound_llms: dict[str, Any] = {}
-        self._tool_nodes: dict[str, ToolNode] = {}
         self._custom_llms: dict[str, Any] = {}  # cache: model_name → LLM instance
 
         self._parse_configs(raw_config)
@@ -117,139 +115,22 @@ class SubAgentManager:
             effective_model_name = self._model_name
 
         bound_llm = effective_llm.bind_tools(tools) if tools else effective_llm
-        self._bound_llms[config.name] = bound_llm
-        self._tool_nodes[config.name] = ToolNode(tools) if tools else None
-
-        max_iter = config.max_iterations
-        max_secs = config.max_seconds
-        subagent_type = config.name
-
-        async def agent_node(state: SubAgentState) -> dict[str, Any]:
-            msgs = list(state.get("messages", []))
-            if not msgs or not isinstance(msgs[0], SystemMessage):
-                msgs = [SystemMessage(content=config.system_prompt)] + msgs
-            msgs = [sanitize_aimessage(m) if isinstance(m, AIMessage) else m for m in msgs]
-
-            trace = state.get("trace")
-
-            # ── Vision: inject screenshot images for vision model; strip before acting model ──
-            if self._vision_llm is not None and msgs and isinstance(msgs[-1], ToolMessage) and getattr(msgs[-1], "name", None) == "computer_screenshot":
-                msgs = await analyze_screenshot(
-                    msgs,
-                    self._vision_llm,
-                    self._vision_model,
-                    trace,
-                    trace_context={"subagent_type": subagent_type},
-                    log=logger,
-                    failure_message="Subagent '%s' vision call failed: %s",
-                    failure_args=(subagent_type,),
-                )
-            # ── end vision block ──
-
-            llm_call = state.get("llm_calls_made", 0) + 1
-
-            start = time.perf_counter()
-            if trace:
-                trace.emit(
-                    "subagent_llm_started",
-                    subagent_type=subagent_type,
-                    llm_call=llm_call,
-                    model=effective_model_name,
-                    backend=self._llm_backend,
-                    message_count=len(msgs),
-                )
-            try:
-                resp = await bound_llm.ainvoke(msgs)
-                cancel = state.get("cancel_event")
-                if cancel and cancel.is_set():
-                    return {
-                        "messages": state.get("messages", []),
-                        "stopped_reason": "cancelled",
-                    }
-            except Exception as exc:
-                if trace:
-                    trace.emit(
-                        "subagent_llm_failed",
-                        subagent_type=subagent_type,
-                        llm_call=llm_call,
-                        duration_ms=duration_ms(start),
-                        error_type=type(exc).__name__,
-                        error=str(exc),
-                    )
-                raise
-
-            reasoning = getattr(resp, "additional_kwargs", {}) or {}
-            reasoning_text = reasoning.get("reasoning_content", "")
-            if reasoning_text and trace:
-                trace.emit("subagent_reasoning", subagent_type=subagent_type, content=reasoning_text)
-
-            usage = getattr(resp, "usage_metadata", None)
-
-            if trace:
-                trace.emit(
-                    "subagent_llm_completed",
-                    subagent_type=subagent_type,
-                    llm_call=llm_call,
-                    duration_ms=duration_ms(start),
-                    content=display_content(resp.content),
-                    tool_calls=getattr(resp, "tool_calls", None) or [],
-                    usage=usage or {},
-                )
-
-            # Detect forced stop: LLM wants more tool calls but limits prevent next iteration
-            tc = state.get("tool_calls_made", 0)
-            has_tool_calls = bool(getattr(resp, "tool_calls", None))
-            stopped_reason = ""
-            if has_tool_calls:
-                if tc + 1 >= max_iter:
-                    stopped_reason = "max_iterations"
-                elif max_secs > 0 and state.get("started_at"):
-                    if time.perf_counter() - state["started_at"] >= max_secs:
-                        stopped_reason = "max_seconds"
-            result: dict[str, Any] = {
-                "messages": msgs + [resp],
-                "tool_calls_made": tc,
-                "llm_calls_made": llm_call,
-            }
-            if stopped_reason:
-                result["stopped_reason"] = stopped_reason
-            return result
-
-        async def tools_node(state: SubAgentState) -> dict[str, Any]:
-            tool_node = self._tool_nodes[config.name]
-            if tool_node is None:
-                return {}
-            with activate_trace(state.get("trace")):
-                out = await tool_node.ainvoke(state)
-            new_msgs = out.get("messages", [])
-            msgs = list(state.get("messages", [])) + new_msgs
-            return {
-                "messages": msgs,
-                "tool_calls_made": state.get("tool_calls_made", 0) + 1,
-            }
-
-        def route(state: SubAgentState) -> str:
-            if state.get("tool_calls_made", 0) >= max_iter:
-                return END
-            if max_secs > 0 and state.get("started_at"):
-                elapsed = time.perf_counter() - state["started_at"]
-                if elapsed >= max_secs:
-                    return END
-            msgs = state.get("messages", [])
-            if not msgs:
-                return END
-            last = msgs[-1]
-            if isinstance(last, AIMessage) and getattr(last, "tool_calls", None):
-                return "tools"
-            return END
-
-        g = StateGraph(SubAgentState)
-        g.add_node("agent", agent_node)
-        g.add_node("tools", tools_node)
-        g.set_entry_point("agent")
-        g.add_conditional_edges("agent", route, {"tools": "tools", END: END})
-        g.add_edge("tools", "agent")
-        self._graphs[config.name] = g.compile()
+        self._graphs[config.name] = build_react_graph(
+            SubAgentState,
+            bound_llm,
+            tools,
+            max_iter=config.max_iterations,
+            max_secs=config.max_seconds,
+            system_prompt=lambda: config.system_prompt,
+            model_name=effective_model_name,
+            backend=self._llm_backend,
+            trace_prefix="subagent_",
+            trace_context={"subagent_type": config.name},
+            vision_llm=self._vision_llm,
+            vision_model=self._vision_model,
+            vision_failure_message="Subagent '%s' vision call failed: %s",
+            vision_failure_args=(config.name,),
+        )
 
     async def run(
         self,
@@ -258,6 +139,7 @@ class SubAgentManager:
         context: str = "",
         trace: TraceCollector | None = None,
         session_id: str = "",
+        cancel_event: asyncio.Event | None = None,
     ) -> SubAgentResult:
         config = self._configs.get(subagent_type)
         if config is None:
@@ -293,6 +175,7 @@ class SubAgentManager:
             "llm_calls_made": 0,
             "trace": trace,
             "started_at": time.perf_counter(),
+            "cancel_event": cancel_event,
         }
 
         start = time.perf_counter()

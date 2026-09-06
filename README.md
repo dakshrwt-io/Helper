@@ -36,13 +36,14 @@ This project can access files and, when enabled, operate the desktop. Treat it l
 
 ## Quick start
 
-From the repository root in PowerShell:
+Clone the repository, then set up Helper in PowerShell:
 
 ```powershell
+git clone https://github.com/dakshrwt-io/Helper.git
+Set-Location Helper
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-npm install
 Copy-Item .env.example .env
 ```
 
@@ -73,7 +74,7 @@ Start Helper:
 python run_server.py
 ```
 
-Open [http://127.0.0.1:8000](http://127.0.0.1:8000), enter `WEB_TOKEN`, and begin a chat. Check the service with:
+Open [http://127.0.0.1:8000](http://127.0.0.1:8000). Always select **Logout** first, then enter the current `WEB_TOKEN` from `.env` and begin a chat. This clears any browser session created with an older token. Check the service with:
 
 ```powershell
 Invoke-WebRequest http://127.0.0.1:8000/health -UseBasicParsing
@@ -82,6 +83,8 @@ Invoke-WebRequest http://127.0.0.1:8000/health -UseBasicParsing
 ## Configuration
 
 `.env.example` is the complete, safe template. Copy it to `.env`; do not commit the copy.
+
+Required variables — the server refuses to start when any of these is unset: `WEB_TOKEN`, `DATA_DIR`, `LLM_BACKEND`, `FILESYSTEM_MCP_DIR`.
 
 | Setting | Purpose |
 |---|---|
@@ -99,7 +102,7 @@ Invoke-WebRequest http://127.0.0.1:8000/health -UseBasicParsing
 | `COMPUTER_CONTROL_LEASE_SECONDS` | Maximum desktop-approval lease length, capped at 300 seconds |
 | `COMPUTER_CONTROL_RATE_LIMIT` | Maximum desktop actions per minute per session |
 
-`config.yaml` contains non-secret application settings and resolves `${VARIABLE}` entries from `.env`. It also defines MCP servers, memory locations, tool limits, and sub-agent roles. Restart the server after changing either file.
+`config.yaml` holds non-secret structural settings — MCP servers, memory locations, agent and sub-agent limits, and the desktop-control switch — and resolves `${VARIABLE}` entries from `.env`. All other runtime knobs (web, Telegram, computer-control limits) come from environment variables. Restart the server after changing either file.
 
 ### Cloud providers
 

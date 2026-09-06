@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 
 from agent.subagents.manager import SubAgentManager
 from agent.subagents.types import SubAgentResult
-from agent.shared import get_active_session_id
+from agent.shared import get_active_session_id, get_cancel_event
 from agent.trace import duration_ms, get_active_trace
 
 
@@ -28,7 +28,7 @@ class TaskArgs(BaseModel):
     )
 
 
-def build_task_tool(manager: SubAgentManager, chatdb: Any = None) -> StructuredTool:
+def build_task_tool(manager: SubAgentManager) -> StructuredTool:
 
     async def _run(subagent_type: str, description: str, context: str = "") -> str:
         trace = get_active_trace()
@@ -52,6 +52,7 @@ def build_task_tool(manager: SubAgentManager, chatdb: Any = None) -> StructuredT
                 context=context,
                 trace=trace,
                 session_id=session_id,
+                cancel_event=get_cancel_event(session_id) if session_id else None,
             )
         except Exception as exc:
             if trace:

@@ -114,6 +114,10 @@ function setBusy(b) { busy = b; sendBtn.disabled = b; input.disabled = b; stopBt
 
 function clearTrace() { activeTrace = null; activeToolPanel = null; pendingToolCard = null; }
 
+function clearThinkingMessages() {
+  msgs.querySelectorAll('.msg.thinking').forEach(t => t.remove());
+}
+
 function startCountdown(delay) {
   if (reconnectCountdownId) clearInterval(reconnectCountdownId);
   let remaining = Math.ceil(delay / 1000);
@@ -340,7 +344,7 @@ function handleMessage(e) {
       addToolEvent(data.event);
     }
   } else if (data.type === 'answer') {
-    msgs.querySelectorAll('.msg.thinking').forEach(t => t.remove());
+    clearThinkingMessages();
     addMsg('assistant', data.text);
     updateStatus(data);
     setBusy(false);
@@ -348,11 +352,11 @@ function handleMessage(e) {
     desktopBtn.textContent = `Desktop: ${data.enabled ? 'on' : 'off'}`;
     desktopBtn.dataset.enabled = data.enabled ? 'true' : 'false';
   } else if (data.type === 'error') {
-    msgs.querySelectorAll('.msg.thinking').forEach(t => t.remove());
+    clearThinkingMessages();
     addMsg('error', data.text);
     setBusy(false);
   } else if (data.type === 'cancelled') {
-    msgs.querySelectorAll('.msg.thinking').forEach(t => t.remove());
+    clearThinkingMessages();
     addMsg('error', 'Task cancelled.');
     setBusy(false);
   }
@@ -379,7 +383,7 @@ function connect() {
   };
   ws.onclose = function (event) {
     clearTrace();
-    msgs.querySelectorAll('.msg.thinking').forEach(function (t) { t.remove(); });
+    clearThinkingMessages();
     setBusy(false);
     if (event.code === 4401) {
       loginView.style.display = 'grid';
@@ -403,9 +407,7 @@ function connect() {
 function send() {
   var text = input.value.trim();
   if (!text) return;
-  activeTrace = null;
-  activeToolPanel = null;
-  pendingToolCard = null;
+  clearTrace();
   addMsg('user', text);
   input.value = '';
   setBusy(true);

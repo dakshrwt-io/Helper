@@ -3,23 +3,28 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
+import pytest
+
 from agent.mcp_adapter import build_langchain_tools
 
 
-def test_build_langchain_tools_uses_cached_definitions() -> None:
+@pytest.mark.parametrize("schema_attribute", ["inputSchema", "input_schema"])
+def test_build_langchain_tools_uses_cached_definitions(
+    schema_attribute: str,
+) -> None:
     class CachedManager:
         @property
         def tool_definitions(self):
             return [
-                SimpleNamespace(
-                    name="read_file",
-                    description="Read a file",
-                    inputSchema={
+                SimpleNamespace(**{
+                    "name": "read_file",
+                    "description": "Read a file",
+                    schema_attribute: {
                         "type": "object",
                         "properties": {"path": {"type": "string"}},
                         "required": ["path"],
                     },
-                )
+                })
             ]
 
         async def list_tools_async(self):

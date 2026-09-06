@@ -5,7 +5,6 @@ the connected browser and is not written to the application logs or database.
 """
 from __future__ import annotations
 
-import asyncio
 import contextvars
 import json
 import threading

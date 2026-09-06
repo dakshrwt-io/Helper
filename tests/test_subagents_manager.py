@@ -185,7 +185,7 @@ async def test_task_tool_builds():
         model_name="test-model",
     )
 
-    task_tool = build_task_tool(manager, chatdb=None)
+    task_tool = build_task_tool(manager)
     assert task_tool.name == "task"
     assert "filesystem" in task_tool.description
     assert "computer_control" in task_tool.description
